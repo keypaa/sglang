@@ -68,3 +68,43 @@ class TestStaticExpertPool(CustomTestCase):
         self.assertIsInstance(ev, torch.cuda.Event)
         # Same object reused (pre-created once, not per call).
         self.assertIs(pool.event_of(0), ev)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestCudaTransferBackend(CustomTestCase):
+    def test_load_writes_into_pool_slot(self):
+        from sglang.srt.layers.moe.expert_cache import (
+            CudaTransferBackend,
+            ExpertCache,
+            ExpertKey,
+            RouterChoice,
+            make_policy,
+        )
+
+        m = _model()
+        num_slots = 8
+        pool = StaticExpertPool(m, HardwareSpec(), None, num_slots=num_slots)
+        backend = CudaTransferBackend(h2d_bw=25e9)
+        backend.set_pool(pool)
+
+        # Pinned fp8 expert store (matches pool dtype; copy_in asserts it).
+        source = {}
+        for e in range(4):
+            base13 = torch.randn(64, 256)
+            base2 = torch.randn(128, 64)
+            source[ExpertKey(0, e)] = (
+                base13.to(torch.float8_e4m3fn).pin_memory(),
+                base2.to(torch.float8_e4m3fn).pin_memory(),
+            )
+        backend.set_expert_source(lambda k: source[k])
+
+        cache = ExpertCache(m, HardwareSpec(), make_policy("lru", num_slots), backend)
+        slot = cache.acquire(RouterChoice(ExpertKey(0, 1), 0.9))
+        pool.wait_all()
+
+        # The expert landed in slot.node.index, mapped 1:1 to the pool.
+        self.assertIsNotNone(slot)
+        got13 = pool.pool_w13()[slot.node.index].cpu()
+        got2 = pool.pool_w2()[slot.node.index].cpu()
+        self.assertTrue(torch.equal(got13, source[ExpertKey(0, 1)][0]))
+        self.assertTrue(torch.equal(got2, source[ExpertKey(0, 1)][1]))

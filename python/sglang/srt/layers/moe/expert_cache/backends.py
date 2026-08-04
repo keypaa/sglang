@@ -112,6 +112,12 @@ class SimBackend(TransferBackend):
 
 
 class CudaTransferBackend(TransferBackend):
+    """Real discrete-GPU backend: pinned host RAM -> STATIC pool slot."""
+
+    @property
+    def name(self) -> str:
+        return "cuda"
+
     def __init__(
         self,
         h2d_bw: float,
@@ -124,50 +130,44 @@ class CudaTransferBackend(TransferBackend):
         self._bw = h2d_bw
         self._device = device if device is not None else torch.device("cuda")
         self._stream = transfer_stream
-        self._expert_source: Optional[Callable[[ExpertKey], torch.Tensor]] = None
+        self._expert_source = None
+        self._pool = None
         self._moved = 0
 
-    @property
-    def name(self) -> str:
-        return "cuda"
+    def set_pool(self, pool) -> None:
+        self._pool = pool
 
-    # The pinned host expert store. `source(key)` must return a pinned CPU
-    # tensor holding that expert's weights.
-    def set_expert_source(self, source: Callable[[ExpertKey], torch.Tensor]) -> None:
+    def set_expert_source(self, source) -> None:
+        """source(key) -> (w13_cpu_pinned, w2_cpu_pinned)."""
         self._expert_source = source
 
-    def load(
-        self,
-        key: ExpertKey,
-        nbytes: int,
-        slot: Slot,
-        on_done: Optional[Callable[[], None]] = None,
-    ) -> float:
+    def load(self, key, nbytes, slot, on_done=None) -> float:
         assert self._expert_source is not None, "set_expert_source() first"
-        torch = self._torch
-        src = self._expert_source(key)
-        dst = slot.addr
-        if dst is None or dst.shape != src.shape or dst.dtype != src.dtype:
-            dst = torch.empty(src.shape, device=self._device, dtype=src.dtype)
-            slot.addr = dst
-        stream = self._stream if self._stream is not None else torch.cuda.current_stream()
-        with torch.cuda.stream(stream):
-            dst.copy_(src, non_blocking=True)
-        slot.event = torch.cuda.Event()
-        slot.event.record(stream)
+        assert self._pool is not None, "set_pool() first"
+        if slot.node.index < 0:
+            # Transient/scratch slot: nothing to copy into the static pool. The
+            # orchestrator upgrades transients to real slots (acquire_resident)
+            # before committing a step, so scratch loads are never read by the
+            # graph. Return zero time so the simulator clock does not stall.
+            if on_done is not None:
+                on_done()
+            return 0.0
+        w13, w2 = self._expert_source(key)
+        # slot.node.index == pool slot id (0..capacity-1); no new field.
+        self._pool.copy_in(slot.node.index, w13, w2)
         self._moved += nbytes
         if on_done is not None:
             on_done()
-        # Estimated fabric time for the virtual-clock bookkeeping.
         return nbytes / self._bw * 1000.0
 
-    # Block the current stream until the slot's async copy completes.
-    def wait_ready(self, slot: Slot) -> None:
-        if slot.event is not None:
-            self._torch.cuda.current_stream().wait_event(slot.event)
+    def wait_ready(self, slot) -> None:
+        # Async copy is on the transfer stream; the graph's baked step-event
+        # wait covers reads. For eager callers, block on the pool.
+        if self._pool is not None:
+            self._pool.wait_all()
 
-    def evict(self, slot: Slot) -> None:
-        slot.event = None
+    def evict(self, slot) -> None:
+        pass  # pool owns storage; addresses are stable.
 
     def effective_bw(self) -> float:
         return self._bw
