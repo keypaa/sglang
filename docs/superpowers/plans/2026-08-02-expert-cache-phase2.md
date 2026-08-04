@@ -331,6 +331,7 @@ git commit -m "feat(expert_cache): add CUDA-graph-safe StaticExpertPool"
 > fp8→fp8 copy, then `.float()` for readability if needed).
 
 ```python
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestCudaTransferBackend(CustomTestCase):
     def test_load_writes_into_pool_slot(self):
         from sglang.srt.layers.moe.expert_cache import (
@@ -383,6 +384,10 @@ Expected: FAIL — `CudaTransferBackend` has no `set_pool`, and `load` still all
 ```python
 class CudaTransferBackend(TransferBackend):
     """Real discrete-GPU backend: pinned host RAM -> STATIC pool slot."""
+
+    @property
+    def name(self) -> str:
+        return "cuda"
 
     def __init__(
         self,
