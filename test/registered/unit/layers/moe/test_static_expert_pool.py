@@ -108,3 +108,86 @@ class TestCudaTransferBackend(CustomTestCase):
         got2 = pool.pool_w2()[slot.node.index].cpu()
         self.assertTrue(torch.equal(got13, source[ExpertKey(0, 1)][0]))
         self.assertTrue(torch.equal(got2, source[ExpertKey(0, 1)][1]))
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestEagerDecodeHarness(CustomTestCase):
+    def test_hit_rate_matches_simulator_under_capacity_pressure(self):
+        import math
+        import random
+
+        from sglang.srt.layers.moe.expert_cache import (
+            CudaTransferBackend, ExpertCache, ExpertKey, HardwareSpec,
+            ModelSpec, RouterChoice, SimBackend, make_policy,
+        )
+
+        m = ModelSpec()
+        m.num_layers = 1
+        m.num_experts = 256
+        m.top_k = 6
+        m.shared_experts = 0
+        m.hidden_size = 64
+        m.intermediate_size = 128
+
+        num_slots = 128  # capacity-bound: cache < key universe
+        hw = HardwareSpec()
+        hw.vram_bytes = 6 * 1024**3
+        hw.h2d_bw = 25e9
+
+        # --- reference hit rate from the Phase-1 simulator ---
+        from sglang.srt.layers.moe.expert_cache import TraceGenerator, run_simulation
+        gen = TraceGenerator(m, seed=7)
+        trace = gen.generate(prefill_tokens=16, decode_tokens=100)
+        ref = run_simulation(
+            m, hw, "logitgds", trace, warm_tokens=4,
+            prefetch_enabled=True, slot_cap_override=num_slots,
+        )
+        ref_hit = ref.decode_hit_rate
+        self.assertGreater(ref_hit, 0.5)
+
+        # --- real CUDA path through the pool ---
+        # fp32 pool: the harness only exercises hit-rate semantics + copies,
+        # not quantized weights (that is Task 7's job). fp8 would force the
+        # store to pre-quantize every expert, adding noise to a hit-rate test.
+        pool = StaticExpertPool(m, hw, None, num_slots=num_slots, dtype=torch.float32)
+        backend = CudaTransferBackend(h2d_bw=hw.h2d_bw)
+        backend.set_pool(pool)
+        cache = ExpertCache(m, hw, make_policy("logitgds", num_slots), backend)
+        orch = StaticPoolOrchestrator(cache, pool, num_experts=m.num_experts,
+                                      num_layers=m.num_layers)
+
+        # pinned CPU expert store: key -> (w13_pinned, w2_pinned)
+        store = {}
+        rng = random.Random(1)
+        for e in range(m.num_experts):
+            w13 = torch.randn(64, 256, dtype=torch.float32)
+            w2 = torch.randn(128, 64, dtype=torch.float32)
+            store[ExpertKey(0, e)] = (
+                w13.pin_memory(), w2.pin_memory(),
+            )
+        backend.set_expert_source(lambda k: store[k])
+
+        # deterministic decode: emit the same expert selections the simulator
+        # saw for decode tokens (reuse trace[·][0] router choices). Hits are
+        # counted BEFORE the step's acquire (= demand hit at step start, the
+        # simulator's definition), and the NEXT token's choices are prefetched
+        # to match the reference's prefetch_enabled=True.
+        warm_tokens = 4
+        decode_trace = [tok[0] for tok in trace[warm_tokens:]]
+        hits = 0
+        total = 0
+        for i, tok in enumerate(decode_trace):
+            expert_ids = [c.key.expert for c in tok]
+            logits = [c.logit for c in tok]
+            hits += sum(1 for e in expert_ids
+                        if cache.is_resident(ExpertKey(0, e)))
+            total += len(expert_ids)
+            next_ids = ([c.key.expert for c in decode_trace[i + 1]]
+                        if i + 1 < len(decode_trace) else [])
+            orch.on_router_output(0, expert_ids, logits, next_ids=next_ids)
+            orch.step_commit()
+        pool.wait_all()
+
+        hit_rate = hits / total
+        # Eager CUDA path must reproduce the simulator within a tolerance.
+        self.assertGreaterEqual(hit_rate, ref_hit - 0.05)
