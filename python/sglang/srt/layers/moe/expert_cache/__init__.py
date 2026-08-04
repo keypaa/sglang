@@ -22,6 +22,7 @@ from .policies import (
     make_policy,
 )
 from .simulator import SimResult, TraceGenerator, run_simulation
+from .static_pool import StaticExpertPool
 from .types import (
     CacheStats,
     ExpertKey,
@@ -48,6 +49,7 @@ __all__ = [
     "SimResult",
     "Slot",
     "SlotState",
+    "StaticExpertPool",
     "TinyLFUPolicy",
     "TraceGenerator",
     "TransferBackend",
