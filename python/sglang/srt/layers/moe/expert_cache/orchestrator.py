@@ -15,10 +15,14 @@ class StaticPoolOrchestrator:
     static slot map the captured graph reads via gather. All host-side; safe
     to call every decode step between graph replays.
 
-    Refcount discipline: every expert acquired this step is released on
-    step_commit (mirrors simulator.py:212's per-token acquire/release), so a
-    busy slot never leaks and the cache never deadlocks into the all-busy
-    acquire_resident RuntimeError.
+    Refcount discipline: every expert acquired by on_router_output is released
+    on step_commit. Commit rhythm is PER LAYER: call on_router_output(layer)
+    then step_commit() once per layer, after that layer's on_router_output and
+    before replaying that layer's graph (mirrors simulator.py:186-211's
+    per-layer acquire/release). on_router_output replaces the held batch, so a
+    second call without an intervening step_commit pins the previous batch's
+    refcounts. With this rhythm a busy slot never leaks and the cache never
+    deadlocks into the all-busy acquire_resident RuntimeError.
     """
 
     def __init__(
