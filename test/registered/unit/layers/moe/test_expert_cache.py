@@ -185,5 +185,15 @@ class TestAdmissionFilter(CustomTestCase):
         self.assertEqual(self._run("logitgds"), self.CAPACITY)
 
 
+class TestModelSpecShapes(CustomTestCase):
+    def test_expert_shapes(self):
+        m = ModelSpec()
+        m.hidden_size = 3840
+        m.intermediate_size = 1536
+        w13_shape, w2_shape = m.expert_shapes()
+        self.assertEqual(w13_shape, (3840, 3072))
+        self.assertEqual(w2_shape, (1536, 3840))
+
+
 if __name__ == "__main__":
     unittest.main()

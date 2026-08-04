@@ -74,6 +74,16 @@ class ModelSpec:
     num_experts: int = 256  # routed experts per layer
     top_k: int = 6  # routed experts selected per token
     shared_experts: int = 1  # always-active experts per layer
+    hidden_size: int = 3840
+    intermediate_size: int = 1536
+
+    def expert_shapes(self) -> tuple:
+        """(w13 shape, w2 shape) for one expert block. w13 is the merged
+        gate+up projection, w2 the down projection (triton-transposed layout)."""
+        I = self.intermediate_size
+        H = self.hidden_size
+        return (H, 2 * I), (I, H)
+
     total_params: int = 284_000_000_000
     active_params: int = 13_000_000_000
     bytes_on_disk: int = 167_000_000_000
