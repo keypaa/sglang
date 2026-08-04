@@ -195,5 +195,51 @@ class TestModelSpecShapes(CustomTestCase):
         self.assertEqual(w2_shape, (1536, 3840))
 
 
+class TestAcquireResident(CustomTestCase):
+    def _make_cache(self, cap, logitgds=True):
+        from sglang.srt.layers.moe.expert_cache import (
+            ExpertCache, HardwareSpec, ModelSpec, SimBackend, make_policy,
+        )
+
+        m = ModelSpec()
+        m.num_layers = 2
+        m.num_experts = 16
+        m.top_k = 1
+        m.shared_experts = 0
+        return ExpertCache(
+            m, HardwareSpec(),
+            make_policy("logitgds" if logitgds else "lru", cap),
+            SimBackend(1e12),
+        )
+
+    def test_demand_miss_overrides_admission(self):
+        from sglang.srt.layers.moe.expert_cache import ExpertKey, RouterChoice
+
+        cache = self._make_cache(4)
+        # Warm a high-value hot set (released each round so slots are evictable).
+        for _ in range(6):
+            held = [cache.acquire(RouterChoice(ExpertKey(0, e), 0.9)) for e in range(4)]
+            for s in held:
+                cache.release(s)
+        # A low-logit one-shot demand is now REJECTED by admission...
+        s = cache.acquire(RouterChoice(ExpertKey(0, 99), 0.01))
+        self.assertLess(s.node.index, 0)  # transient -> negative scratch index
+        cache.release(s)
+        # ...but acquire_resident guarantees a real slot for a committed step.
+        s2 = cache.acquire_resident(RouterChoice(ExpertKey(0, 98), 0.01))
+        self.assertGreaterEqual(s2.node.index, 0)
+        self.assertTrue(cache.is_resident(ExpertKey(0, 98)))
+        cache.release(s2)
+
+    def test_acquire_resident_raises_when_all_busy(self):
+        from sglang.srt.layers.moe.expert_cache import ExpertKey, RouterChoice
+
+        cache = self._make_cache(1)
+        held = cache.acquire_resident(RouterChoice(ExpertKey(0, 0), 0.9))
+        self.assertTrue(cache.is_resident(ExpertKey(0, 0)))
+        with self.assertRaises(RuntimeError):
+            cache.acquire_resident(RouterChoice(ExpertKey(0, 1), 0.9))
+
+
 if __name__ == "__main__":
     unittest.main()

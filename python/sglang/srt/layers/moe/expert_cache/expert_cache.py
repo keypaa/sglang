@@ -108,6 +108,47 @@ class ExpertCache:
         self._stats.admission_rejected += 1
         return self._load_transient(k)
 
+    def acquire_resident(self, choice: RouterChoice) -> Slot:
+        """Demand acquire that MUST land in a real (resident) slot.
+
+        Used by the Phase-2 orchestrator so a committed decode step never maps
+        an expert to the -1 / transient slot. Skips the admission filter
+        (demand correctness > admission) but otherwise reuses the standard
+        load path including the busy-victim rule.
+        """
+        k = choice.key
+        s = self._index.get(k)
+        if s is not None:
+            if s.state == SlotState.READY:
+                self._policy.on_access(s.node, choice.logit)
+                s.refcount += 1
+                self._stats.hits += 1
+                return s
+            s.refcount += 1
+            self._stats.hits += 1
+            return s
+        self._stats.misses += 1
+        s = self._force_load_into_cache(k, choice.logit)
+        if s is None:
+            raise RuntimeError(
+                f"acquire_resident: no evictable slot for {k} (all slots busy)"
+            )
+        s.refcount += 1
+        return s
+
+    def _force_load_into_cache(self, k, logit) -> Optional[Slot]:
+        busy: Set[KeyNode] = set()
+        for s in self._slots:
+            if s.refcount > 0 or s.state == SlotState.LOADING:
+                busy.add(s.node)
+        if self._policy.size() < self._policy.capacity():
+            victim = None
+        else:
+            victim = self._policy.victim(busy)
+        if victim is None and not self._free:
+            return None
+        return self._load_into_cache(k, logit, False)
+
     # ---- release -----------------------------------------------------------
     def release(self, s: Slot) -> None:
         if s.refcount > 0:
