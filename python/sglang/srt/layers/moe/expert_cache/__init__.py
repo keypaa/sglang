@@ -13,6 +13,7 @@ Python. A later phase wires these into the DeepSeek-V4 MoE forward pass.
 from .backends import CudaTransferBackend, SimBackend, TransferBackend
 from .expert_cache import ExpertCache, Slot
 from .freq_sketch import FreqSketch
+from .orchestrator import StaticPoolOrchestrator
 from .policies import (
     EvictionPolicy,
     KeyNode,
@@ -50,6 +51,7 @@ __all__ = [
     "Slot",
     "SlotState",
     "StaticExpertPool",
+    "StaticPoolOrchestrator",
     "TinyLFUPolicy",
     "TraceGenerator",
     "TransferBackend",
