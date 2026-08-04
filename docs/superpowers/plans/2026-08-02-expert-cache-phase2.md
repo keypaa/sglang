@@ -682,18 +682,33 @@ class TestOrchestrator(CustomTestCase):
         orch = StaticPoolOrchestrator(cache, pool, num_experts=16, num_layers=2)
         orch.on_router_output(0, [3], [0.9], [])
         orch.step_commit()
-        copied_after_first = len(pool.copied)
+        hits_after_first = cache.stats.hits
+        misses_after_first = cache.stats.misses
+        slot_after_first = orch.slot_id_of(0, 3)
         orch.on_router_output(0, [3], [0.9], [])
         orch.step_commit()
-        self.assertEqual(len(pool.copied), copied_after_first)  # hit: no copy
+        # A hit must not reload: one more demand hit, no new miss/load.
+        self.assertEqual(cache.stats.hits, hits_after_first + 1)
+        self.assertEqual(cache.stats.misses, misses_after_first)
+        self.assertEqual(orch.slot_id_of(0, 3), slot_after_first)
 
     def test_step_commit_flags_only_when_copies_pending(self):
         pool = FakePool(8)
         cache = _cache(8)
         orch = StaticPoolOrchestrator(cache, pool, num_experts=16, num_layers=2)
-        # Hit only -> no pending copies -> commit returns False / no-op.
+        # Hit only -> no pending copies -> the pool flag stays clear.
         orch.on_router_output(0, [3], [0.9], [])
         orch.step_commit()
+        self.assertEqual(pool.pending, 0)
+        # First routing was a demand miss -> one load, no additional miss.
+        self.assertEqual(cache.stats.misses, 1)
+        self.assertEqual(cache.stats.loads, 1)
+        # Second routing of the same expert is a hit (no reload), still clean.
+        hits_before = cache.stats.hits
+        orch.on_router_output(0, [3], [0.9], [])
+        orch.step_commit()
+        self.assertEqual(cache.stats.hits, hits_before + 1)
+        self.assertEqual(cache.stats.misses, 1)
         self.assertEqual(pool.pending, 0)
 
     def test_rejected_one_shot_is_upgraded_to_resident(self):
@@ -748,10 +763,14 @@ class StaticPoolOrchestrator:
     static slot map the captured graph reads via gather. All host-side; safe
     to call every decode step between graph replays.
 
-    Refcount discipline: every expert acquired this step is released on
-    step_commit (mirrors simulator.py:212's per-token acquire/release), so a
-    busy slot never leaks and the cache never deadlocks into the all-busy
-    acquire_resident RuntimeError.
+    Refcount discipline: every expert acquired by on_router_output is released
+    on step_commit. Commit rhythm is PER LAYER: call on_router_output(layer)
+    then step_commit() once per layer, after that layer's on_router_output and
+    before replaying that layer's graph (mirrors simulator.py:186-211's
+    per-layer acquire/release). on_router_output replaces the held batch, so a
+    second call without an intervening step_commit pins the previous batch's
+    refcounts. With this rhythm a busy slot never leaks and the cache never
+    deadlocks into the all-busy acquire_resident RuntimeError.
     """
 
     def __init__(
