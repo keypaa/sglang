@@ -861,6 +861,7 @@ git commit -m "feat(expert_cache): add Phase-A StaticPoolOrchestrator + CPU unit
 - [ ] **Step 1: Write the failing test**
 
 ```python
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestEagerDecodeHarness(CustomTestCase):
     def test_hit_rate_matches_simulator_under_capacity_pressure(self):
         import math
@@ -922,6 +923,7 @@ class TestEagerDecodeHarness(CustomTestCase):
         # counted BEFORE the step's acquire (= demand hit at step start, the
         # simulator's definition), and the NEXT token's choices are prefetched
         # to match the reference's prefetch_enabled=True.
+        warm_tokens = 4
         decode_trace = [tok[0] for tok in trace[warm_tokens:]]
         hits = 0
         total = 0
@@ -967,7 +969,7 @@ Expected: all PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add python/sglang/srt/layers/moe/expert_cache/orchestrator.py test/registered/unit/layers/moe/test_static_expert_pool.py test/registered/unit/layers/moe/test_expert_cache_orchestrator.py
+git add test/registered/unit/layers/moe/test_static_expert_pool.py
 git commit -m "feat(expert_cache): eager decode harness reproduces simulated hit rate"
 ```
 
