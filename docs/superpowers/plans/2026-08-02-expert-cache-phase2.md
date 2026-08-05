@@ -869,7 +869,8 @@ class TestEagerDecodeHarness(CustomTestCase):
 
         from sglang.srt.layers.moe.expert_cache import (
             CudaTransferBackend, ExpertCache, ExpertKey, HardwareSpec,
-            ModelSpec, RouterChoice, SimBackend, make_policy,
+            ModelSpec, RouterChoice, SimBackend, StaticPoolOrchestrator,
+            make_policy,
         )
 
         m = ModelSpec()
