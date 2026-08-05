@@ -113,12 +113,12 @@ class TestCudaTransferBackend(CustomTestCase):
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestEagerDecodeHarness(CustomTestCase):
     def test_hit_rate_matches_simulator_under_capacity_pressure(self):
-        import math
         import random
 
         from sglang.srt.layers.moe.expert_cache import (
             CudaTransferBackend, ExpertCache, ExpertKey, HardwareSpec,
-            ModelSpec, RouterChoice, SimBackend, make_policy,
+            ModelSpec, RouterChoice, SimBackend, StaticPoolOrchestrator,
+            make_policy,
         )
 
         m = ModelSpec()
