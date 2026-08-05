@@ -191,3 +191,102 @@ class TestEagerDecodeHarness(CustomTestCase):
         hit_rate = hits / total
         # Eager CUDA path must reproduce the simulator within a tolerance.
         self.assertGreaterEqual(hit_rate, ref_hit - 0.05)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestCapturedDecodeHarness(CustomTestCase):
+    def test_graph_replay_tracks_updated_slot_contents(self):
+        import random
+
+        from sglang.srt.layers.moe.expert_cache import (
+            CudaTransferBackend, ExpertCache, ExpertKey, HardwareSpec,
+            ModelSpec, RouterChoice, StaticPoolOrchestrator, make_policy,
+        )
+
+        m = ModelSpec()
+        m.num_layers = 1
+        m.num_experts = 64
+        m.top_k = 4
+        m.shared_experts = 0
+        m.hidden_size = 32
+        m.intermediate_size = 16   # so h@w13 -> gate/up -> mid@w2 -> h composes
+
+        num_slots = 16
+        hw = HardwareSpec()
+        hw.vram_bytes = 6 * 1024**3
+        hw.h2d_bw = 25e9
+
+        pool = StaticExpertPool(m, hw, None, num_slots=num_slots, dtype=torch.float32)
+        backend = CudaTransferBackend(h2d_bw=hw.h2d_bw)
+        backend.set_pool(pool)
+        cache = ExpertCache(m, hw, make_policy("logitgds", num_slots), backend)
+        orch = StaticPoolOrchestrator(cache, pool, m.num_experts, m.num_layers)
+
+        rng = random.Random(3)
+        store = {}
+        for e in range(m.num_experts):
+            store[ExpertKey(0, e)] = (
+                torch.randn(32, 32, dtype=torch.float32).pin_memory(),
+                torch.randn(16, 32, dtype=torch.float32).pin_memory(),
+            )
+        backend.set_expert_source(lambda k: store[k])
+
+        # ---- Phase A once, before capture warmup ----
+        first_ids = [1, 2, 3, 4]
+        orch.on_router_output(0, first_ids, [0.9] * 4, next_ids=[])
+        orch.step_commit()
+        pool.wait_all()
+
+        # ---- static capture inputs (pre-allocated, no alloc in capture) ----
+        activations = torch.randn(1, 32, device="cuda")
+        topk_ids_buf = torch.zeros(1, 4, dtype=torch.int64, device="cuda")
+        slot_map_buf = orch.slot_map_tensor().to(dtype=torch.int64, device="cuda")
+        out_buf = torch.zeros(1, 4, 32, device="cuda")
+        H, I = 32, 16
+
+        def moe_ffn(slot_ids):
+            """Shared by captured forward and eager reference: per-slot FFN."""
+            w13 = pool.pool_w13()[slot_ids]            # [n, H, 2I]
+            w2 = pool.pool_w2()[slot_ids]              # [n, I, H]
+            up = torch.matmul(activations, w13)        # [1, n, 2I]
+            gate, act = up.chunk(2, dim=-1)            # [1, n, I], [1, n, I]
+            mid = gate * torch.gelu(act)               # [1, n, I]
+            return torch.matmul(mid, w2)               # [1, n, H]
+
+        def fake_decode_forward():
+            # Captured: wait on per-step event, map topk ids -> slot ids via the
+            # static slot-map buffer, gather pool weights, run the FFN.
+            torch.cuda.current_stream().wait_event(pool.step_event())
+            ids = topk_ids_buf.view(-1)                     # [n]
+            slot_ids = slot_map_buf.index_select(0, ids)    # [n] (no alloc)
+            out_buf.copy_(moe_ffn(slot_ids))
+
+        # warmup on a side stream (allocations go to the graph pool — legal)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=torch.cuda.Stream()):
+            fake_decode_forward()
+
+        def eager_reference(ids):
+            slot_ids = torch.tensor([orch.slot_id_of(0, e) for e in ids],
+                                    dtype=torch.int64, device="cuda")
+            return moe_ffn(slot_ids)
+
+        # Step 1: replay 8 steps with ROTATING slot contents; out_buf must
+        # equal eager_reference for the same ids each time. Before each replay
+        # we ensure residency (updating the slot map + issuing any demand
+        # copies into the same static addresses) and re-point the buffers.
+        for step in range(8):
+            ids = [step % 8, (step + 1) % 8, (step + 2) % 8, (step + 3) % 8]
+            orch.on_router_output(0, ids, [0.9] * 4, next_ids=[])
+            # Spec §6: a committed step never maps an expert to -1.
+            for e in ids:
+                self.assertNotEqual(orch.slot_id_of(0, e), -1,
+                                    f"step {step}: expert {e} not resident")
+            orch.step_commit()
+            pool.wait_all()
+            topk_ids_buf.copy_(torch.tensor([ids], dtype=torch.int64, device="cuda"))
+            slot_map_buf.copy_(orch.slot_map_tensor().to(dtype=torch.int64, device="cuda"))
+            g.replay()
+            torch.cuda.synchronize()
+            self.assertTrue(torch.allclose(out_buf, eager_reference(ids),
+                                           atol=1e-4), f"step {step} mismatch")
