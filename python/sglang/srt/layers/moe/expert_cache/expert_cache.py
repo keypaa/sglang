@@ -12,7 +12,8 @@ from .types import CacheStats, ExpertKey, HardwareSpec, ModelSpec, RouterChoice,
 #
 # Owns a fixed array of VRAM slots (fixed-address, allocated once), a hash
 # index keyed by (layer, expert), an eviction policy, and a transfer backend.
-# Exposes the demand-fetch and prefetch lifecycles described in DESIGN.md. The
+# Exposes the demand-fetch and prefetch lifecycles described in
+# docs/superpowers/specs/2026-08-02-expert-cache-phase2-design.md. The
 # simulator drives it in virtual time; on real hardware the same API is called
 # from the engine's scheduler with the CUDA backend.
 #
