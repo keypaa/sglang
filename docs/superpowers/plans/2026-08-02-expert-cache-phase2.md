@@ -987,13 +987,14 @@ git commit -m "feat(expert_cache): eager decode harness reproduces simulated hit
 - [ ] **Step 1: Write the failing test**
 
 ```python
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestCapturedDecodeHarness(CustomTestCase):
     def test_graph_replay_tracks_updated_slot_contents(self):
         import random
 
         from sglang.srt.layers.moe.expert_cache import (
             CudaTransferBackend, ExpertCache, ExpertKey, HardwareSpec,
-            ModelSpec, RouterChoice, make_policy,
+            ModelSpec, RouterChoice, StaticPoolOrchestrator, make_policy,
         )
 
         m = ModelSpec()
