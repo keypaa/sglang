@@ -1,8 +1,10 @@
 # Phase 2 Design: Static MoE Expert Pool (CUDA-Graph-Safe)
 
 **Date:** 2026-08-02
-**Status:** Draft for review
+**Status:** Implemented
 **Builds on:** Phase 1 (pure-Python `expert_cache` package, validated against the C++ MoE-LRU simulator)
+
+**Phase 2 implemented** 2026-08-05: `StaticExpertPool` (§3.1), `CudaTransferBackend` writes into the pool (§3.2), `StaticPoolOrchestrator` with demand-guarantee `acquire_resident` (§3.3, §6), plus the 4-test matrix (§7): CPU orchestration unit tests, CUDA copy unit tests, the eager decode harness, and the captured CUDA-graph decode harness. Test commits: `b2c2a1fb0` … `7b1b272ee`. CUDA-gated tests run pending a CUDA host/CI.
 
 ---
 
