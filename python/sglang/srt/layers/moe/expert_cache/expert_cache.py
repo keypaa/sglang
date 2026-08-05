@@ -219,6 +219,10 @@ class ExpertCache:
         return self._model
 
     @property
+    def capacity(self) -> int:
+        return self._policy.capacity()
+
+    @property
     def hw(self) -> HardwareSpec:
         return self._hw
 

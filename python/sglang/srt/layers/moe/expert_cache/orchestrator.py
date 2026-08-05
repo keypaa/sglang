@@ -36,7 +36,20 @@ class StaticPoolOrchestrator:
         self._pool = pool
         self._num_experts = num_experts
         self._num_layers = num_layers
-        self._slot_map = torch.full((num_experts,), -1, dtype=torch.int32)
+        # The cache's resident set and the pool's slot count must match: the
+        # backend writes slot.node.index (0..capacity-1) into pool.copy_in,
+        # which asserts 0 <= slot_id < num_slots. A mismatch silently diverges.
+        assert cache.capacity == pool.num_slots, (
+            f"cache capacity {cache.capacity} != pool.num_slots {pool.num_slots}"
+        )
+        # Keyed by (layer, expert): each layer owns its own expert id space, so
+        # two layers routing the same id must not clobber one slot-map entry.
+        self._slot_map = torch.full(
+            (num_layers, num_experts), -1, dtype=torch.int32
+        )
+        # The layer whose map slot_map_tensor() exposes (the graph reads one
+        # layer's static map per Phase-A instance).
+        self._active_layer = 0
         self._held: List[Slot] = []
 
     def on_router_output(
@@ -52,6 +65,7 @@ class StaticPoolOrchestrator:
             raise IndexError("expert id out of range")
 
         self._held = []
+        self._active_layer = layer
         for eid, conf in zip(expert_ids, logit):
             choice = RouterChoice(ExpertKey(layer, eid), conf)
             # Normal path honors admission (matches the simulator's hit rate);
@@ -61,7 +75,7 @@ class StaticPoolOrchestrator:
             if slot.node.index < 0:
                 self._cache.release(slot)
                 slot = self._cache.acquire_resident(choice)
-            self._slot_map[eid] = slot.node.index
+            self._slot_map[layer, eid] = slot.node.index
             self._held.append(slot)
 
         if next_ids:
@@ -80,7 +94,12 @@ class StaticPoolOrchestrator:
         self._held = []
 
     def slot_map_tensor(self) -> torch.Tensor:
-        return self._slot_map
+        # Flat view of the active layer's expert->slot map. The captured graph
+        # gathers by expert id on this single layer's map (one map per
+        # Phase-A graph instance).
+        return self._slot_map[self._active_layer]
 
     def slot_id_of(self, layer: int, expert_id: int) -> int:
-        return int(self._slot_map[expert_id])
+        if layer < 0 or layer >= self._num_layers:
+            raise IndexError("layer out of range")
+        return int(self._slot_map[layer, expert_id])

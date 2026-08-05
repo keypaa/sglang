@@ -116,3 +116,25 @@ class TestOrchestrator(CustomTestCase):
         orch = StaticPoolOrchestrator(cache, pool, num_experts=16, num_layers=2)
         with self.assertRaises(IndexError):
             orch.on_router_output(0, [99], [0.9], [])
+
+    def test_slot_map_is_keyed_by_layer_not_shared(self):
+        # Two layers route the SAME expert id; each layer's map entry must be
+        # independent (the graph reads layer L's own map).
+        pool = FakePool(8)
+        cache = _cache(8)
+        orch = StaticPoolOrchestrator(cache, pool, num_experts=16, num_layers=2)
+
+        orch.on_router_output(0, [3], [0.9], [])
+        orch.step_commit()
+        layer0_slot = orch.slot_id_of(0, 3)
+        self.assertGreaterEqual(layer0_slot, 0)
+
+        orch.on_router_output(1, [3], [0.9], [])
+        orch.step_commit()
+        layer1_slot = orch.slot_id_of(1, 3)
+        self.assertGreaterEqual(layer1_slot, 0)
+
+        # Layer-0's mapping for expert 3 is untouched by layer 1's routing.
+        self.assertEqual(orch.slot_id_of(0, 3), layer0_slot)
+        # slot_map_tensor() reflects the ACTIVE layer (layer 1 here).
+        self.assertEqual(orch.slot_map_tensor()[3].item(), layer1_slot)

@@ -196,8 +196,6 @@ class TestEagerDecodeHarness(CustomTestCase):
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestCapturedDecodeHarness(CustomTestCase):
     def test_graph_replay_tracks_updated_slot_contents(self):
-        import random
-
         from sglang.srt.layers.moe.expert_cache import (
             CudaTransferBackend, ExpertCache, ExpertKey, HardwareSpec,
             ModelSpec, RouterChoice, StaticPoolOrchestrator, make_policy,
@@ -222,7 +220,6 @@ class TestCapturedDecodeHarness(CustomTestCase):
         cache = ExpertCache(m, hw, make_policy("logitgds", num_slots), backend)
         orch = StaticPoolOrchestrator(cache, pool, m.num_experts, m.num_layers)
 
-        rng = random.Random(3)
         store = {}
         for e in range(m.num_experts):
             store[ExpertKey(0, e)] = (
@@ -242,12 +239,9 @@ class TestCapturedDecodeHarness(CustomTestCase):
         topk_ids_buf = torch.zeros(1, 4, dtype=torch.int64, device="cuda")
         slot_map_buf = orch.slot_map_tensor().to(dtype=torch.int64, device="cuda")
         out_buf = torch.zeros(1, 4, 32, device="cuda")
-        H, I = 32, 16
 
-        def moe_ffn(slot_ids):
-            """Shared by captured forward and eager reference: per-slot FFN."""
-            w13 = pool.pool_w13()[slot_ids]            # [n, H, 2I]
-            w2 = pool.pool_w2()[slot_ids]              # [n, I, H]
+        def moe_ffn(w13, w2):
+            """Shared FFN: weights already gathered per routed expert."""
             up = torch.matmul(activations, w13)        # [1, n, 2I]
             gate, act = up.chunk(2, dim=-1)            # [1, n, I], [1, n, I]
             mid = gate * torch.gelu(act)               # [1, n, I]
@@ -259,7 +253,8 @@ class TestCapturedDecodeHarness(CustomTestCase):
             torch.cuda.current_stream().wait_event(pool.step_event())
             ids = topk_ids_buf.view(-1)                     # [n]
             slot_ids = slot_map_buf.index_select(0, ids)    # [n] (no alloc)
-            out_buf.copy_(moe_ffn(slot_ids))
+            out_buf.copy_(moe_ffn(pool.pool_w13()[slot_ids],
+                                  pool.pool_w2()[slot_ids]))
 
         # warmup on a side stream (allocations go to the graph pool — legal)
         g = torch.cuda.CUDAGraph()
@@ -267,16 +262,21 @@ class TestCapturedDecodeHarness(CustomTestCase):
             fake_decode_forward()
 
         def eager_reference(ids):
-            slot_ids = torch.tensor([orch.slot_id_of(0, e) for e in ids],
-                                    dtype=torch.int64, device="cuda")
-            return moe_ffn(slot_ids)
+            # Authoritative oracle: read the CPU store by expert id, NOT the
+            # pool. If a pool slot ever held stale/mispaired bytes this diverges
+            # from the graph's out_buf, so a wrong outcome cannot silently pass.
+            ws = [store[ExpertKey(0, e)] for e in ids]
+            w13 = torch.stack([w[0].to("cuda") for w in ws])  # [n, H, 2I]
+            w2 = torch.stack([w[1].to("cuda") for w in ws])   # [n, I, H]
+            return moe_ffn(w13, w2)
 
-        # Step 1: replay 8 steps with ROTATING slot contents; out_buf must
-        # equal eager_reference for the same ids each time. Before each replay
-        # we ensure residency (updating the slot map + issuing any demand
-        # copies into the same static addresses) and re-point the buffers.
+        # Route MORE distinct experts than num_slots (32 > 16) so a slot is
+        # evicted and re-copied with a DIFFERENT expert mid-test; the graph must
+        # read the updated bytes the reference expects. Before each replay we
+        # ensure residency (updating the slot map + issuing any demand copies
+        # into the same static addresses) and re-point the buffers.
         for step in range(8):
-            ids = [step % 8, (step + 1) % 8, (step + 2) % 8, (step + 3) % 8]
+            ids = [step * 4 + k for k in range(4)]
             orch.on_router_output(0, ids, [0.9] * 4, next_ids=[])
             # Spec §6: a committed step never maps an expert to -1.
             for e in ids:
