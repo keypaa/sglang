@@ -259,6 +259,15 @@ class TestCapturedDecodeHarness(CustomTestCase):
             out_buf.copy_(moe_ffn(pool.pool_w13()[slot_ids],
                                   pool.pool_w2()[slot_ids]))
 
+        # Warmup on a side stream BEFORE capture (torch's standard
+        # warmup -> capture -> replay recipe): the first cuBLAS call creates
+        # its handle/workspace, which cannot happen inside a capture.
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            fake_decode_forward()
+        torch.cuda.current_stream().wait_stream(s)
+
         # warmup on a side stream (allocations go to the graph pool — legal)
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g, stream=torch.cuda.Stream()):
