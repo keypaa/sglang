@@ -244,7 +244,7 @@ class TestCapturedDecodeHarness(CustomTestCase):
             """Shared FFN: weights already gathered per routed expert."""
             up = torch.matmul(activations, w13)        # [1, n, 2I]
             gate, act = up.chunk(2, dim=-1)            # [1, n, I], [1, n, I]
-            mid = gate * torch.gelu(act)               # [1, n, I]
+            mid = gate * torch.nn.functional.gelu(act)  # [1, n, I]
             return torch.matmul(mid, w2)               # [1, n, H]
 
         def fake_decode_forward():
