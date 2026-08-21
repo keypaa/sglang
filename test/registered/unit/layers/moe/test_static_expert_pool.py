@@ -248,23 +248,20 @@ class TestCapturedDecodeHarness(CustomTestCase):
             return torch.matmul(mid, w2)               # [1, n, H]
 
         def fake_decode_forward():
-            # Captured: wait on per-step event, map topk ids -> slot ids via the
-            # static slot-map buffer, gather pool weights, run the FFN.
-            torch.cuda.current_stream().wait_event(pool.step_event())
+            # Captured: map topk ids -> slot ids via the static slot-map
+            # buffer, gather pool weights, run the FFN. NO in-graph wait on
+            # pool.step_event(): a captured stream may not create a
+            # dependency on uncaptured transfer-stream work
+            # (cudaErrorStreamCaptureIsolation). Copy->read ordering is
+            # enforced at replay time instead (see the loop below).
             ids = topk_ids_buf.view(-1)                     # [n]
             slot_ids = slot_map_buf.index_select(0, ids)    # [n] (no alloc)
             out_buf.copy_(moe_ffn(pool.pool_w13()[slot_ids],
                                   pool.pool_w2()[slot_ids]))
 
-        # warmup on a side stream (allocations go to the graph pool — legal).
-        # relaxed: the captured wait_event(pool.step_event()) references
-        # uncaptured transfer-stream work by design (spec §5: one reusable
-        # step event, re-recorded per step; the baked wait tracks its latest
-        # record at each replay). Strict capture modes forbid that reference.
+        # warmup on a side stream (allocations go to the graph pool — legal)
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(
-            g, stream=torch.cuda.Stream(), capture_error_mode="relaxed"
-        ):
+        with torch.cuda.graph(g, stream=torch.cuda.Stream()):
             fake_decode_forward()
 
         def eager_reference(ids):
@@ -278,9 +275,11 @@ class TestCapturedDecodeHarness(CustomTestCase):
 
         # Route MORE distinct experts than num_slots (32 > 16) so a slot is
         # evicted and re-copied with a DIFFERENT expert mid-test; the graph must
-        # read the updated bytes the reference expects. Before each replay we
+        # read the updated bytes the reference expects. Before each replay:
         # ensure residency (updating the slot map + issuing any demand copies
-        # into the same static addresses) and re-point the buffers.
+        # into the same static addresses), enforce copy->read ordering with
+        # pool.wait_all() (host-side stand-in for the step-event barrier),
+        # then re-point the buffers.
         for step in range(8):
             ids = [step * 4 + k for k in range(4)]
             orch.on_router_output(0, ids, [0.9] * 4, next_ids=[])
