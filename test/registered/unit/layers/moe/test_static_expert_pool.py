@@ -242,10 +242,12 @@ class TestCapturedDecodeHarness(CustomTestCase):
 
         def moe_ffn(w13, w2):
             """Shared FFN: weights already gathered per routed expert."""
-            up = torch.matmul(activations, w13)        # [n, 2I]
-            gate, act = up.chunk(2, dim=-1)            # [n, I], [n, I]
+            up = torch.matmul(activations, w13)         # [n, 2I]
+            gate, act = up.chunk(2, dim=-1)             # [n, I], [n, I]
             mid = gate * torch.nn.functional.gelu(act)  # [n, I]
-            return torch.matmul(mid, w2)               # [n, H]
+            # bmm: per-row down projection. matmul(mid [n,I], w2 [n,I,H])
+            # would BROADCAST mid into the batch dim instead ([n,n,H]).
+            return torch.bmm(mid.unsqueeze(1), w2).squeeze(1)  # [n, H]
 
         def fake_decode_forward():
             # Captured: map topk ids -> slot ids via the static slot-map
