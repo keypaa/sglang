@@ -74,32 +74,42 @@ tests. Phase 2 (HEAD since `16f4bf596`) added the GPU-fast, capture-safe tier:
 
 ## Verification status
 
-CPU tests (no CUDA available locally): **21 passed / 7 skipped** — run with
+**GPU-verified: 28 passed / 0 failed** on a Modal L4 (sm_89,
+`lmsysorg/sglang:latest` image). All 28 tests execute on real hardware —
+the 21 CPU tests plus the 7 CUDA-gated ones (pool copy units, backend
+H2D, eager harness, captured-graph harness).
+
+CPU-only re-run (no CUDA needed):
 
 ```bash
-PYTHONPATH=<shim> python -m pytest \
+PYTHONPATH=python python -m pytest \
   test/registered/unit/layers/moe/test_expert_cache.py \
   test/registered/unit/layers/moe/test_expert_cache_simulator.py \
   test/registered/unit/layers/moe/test_expert_cache_orchestrator.py \
   test/registered/unit/layers/moe/test_static_expert_pool.py -q
 ```
 
-Verified on CPU:
+GPU harness: `/tmp/opencode/modal_gpu_verify.py`
+(`python -m modal run /tmp/opencode/modal_gpu_verify.py`) — official
+sglang Docker image + the repo mounted via `PYTHONPATH`; hand-picked
+PyPI deps do **not** work (pip's `sgl_kernel` wheel ships sm100 binaries
+only and lacks `libnvrtc.so.12`).
 
-- all orchestrator units (hit/miss bookkeeping, transient→resident upgrade,
-  `-1` never committed, cross-layer independence, bounds checks);
-- eager harness hit rate `0.7708` ≥ `0.7565` reference (sim `0.8065` − tol).
+Design findings from the GPU runs (worth knowing before extending this):
 
-**Pending GPU run** (must verify on a CUDA host / CI before trusting):
-
-- the 4 CUDA-gated test classes (skips locally): `StaticExpertPool` copy
-  units, the eager harness, and especially the captured-graph harness
-  (replay-stream legality, fp8 copy, gather/GEMM numerics).
+- A captured graph may **not** wait on `pool.step_event()`
+  (`cudaErrorStreamCaptureIsolation`, persists under
+  `capture_error_mode="relaxed"`): a captured stream cannot depend on
+  uncaptured transfer-stream work. Copy→read ordering is therefore
+  enforced at replay time (`pool.wait_all()` before replay), not by a
+  baked in-graph wait. Spec §5's original "graph waits on step event"
+  wording is superseded.
+- cuBLAS must be warmed up on a side stream before capture —
+  `cublasCreate` inside a capture fails.
 
 Known environment caveat (unrelated): 4 sibling tests under
 `test/registered/unit/layers/moe/` (`test_aiter_runner.py`, etc.) fail to
-**collect** on this machine because they import `sglang.srt.layers.moe.moe_runner`,
-which requires the full package + `pybase64`; they are not part of the
+collect without the full package deps; they are not part of the
 expert-cache suite.
 
 ## How the pieces were validated

@@ -208,6 +208,14 @@ False), the event is not re-recorded this step, so the wait is a no-op.
 - **Demand copies** are gated by the per-step barrier: they are enqueued in
   Phase A *before* `record()`, so the graph waits only for what it actually
   needs this step.
+  **GPU-verified amendment (2026-08-21):** the barrier wait cannot live
+  *inside* the captured graph — a captured stream may not create a dependency
+  on uncaptured transfer-stream work (`cudaErrorStreamCaptureIsolation`;
+  persists under `capture_error_mode="relaxed"`). Copy→read ordering is
+  enforced at **replay time** instead (host waits on the step event /
+  `pool.wait_all()` before `g.replay()`; the Phase-A orchestrator's slot-map
+  update is host-side anyway). `record_step` remains the producer-side
+  barrier primitive for eager paths.
 - **Miss stall:** a demand miss is a synchronous stall by design (rare, ~2%).
   Prefetch hides most of it; the barrier never adds latency beyond the copy.
 
