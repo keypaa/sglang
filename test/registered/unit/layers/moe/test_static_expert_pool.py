@@ -256,9 +256,15 @@ class TestCapturedDecodeHarness(CustomTestCase):
             out_buf.copy_(moe_ffn(pool.pool_w13()[slot_ids],
                                   pool.pool_w2()[slot_ids]))
 
-        # warmup on a side stream (allocations go to the graph pool — legal)
+        # warmup on a side stream (allocations go to the graph pool — legal).
+        # relaxed: the captured wait_event(pool.step_event()) references
+        # uncaptured transfer-stream work by design (spec §5: one reusable
+        # step event, re-recorded per step; the baked wait tracks its latest
+        # record at each replay). Strict capture modes forbid that reference.
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g, stream=torch.cuda.Stream()):
+        with torch.cuda.graph(
+            g, stream=torch.cuda.Stream(), capture_error_mode="relaxed"
+        ):
             fake_decode_forward()
 
         def eager_reference(ids):
