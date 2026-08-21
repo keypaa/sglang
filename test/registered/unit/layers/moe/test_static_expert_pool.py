@@ -21,7 +21,7 @@ def _model():
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestStaticExpertPool(CustomTestCase):
     def test_allocated_shapes_and_static_addresses(self):
-        pool = StaticExpertPool(_model(), HardwareSpec(), None, num_slots=32)
+        pool = StaticExpertPool(_model(), HardwareSpec(), None, 32)
 
         self.assertEqual(tuple(pool.pool_w13().shape), (32, 64, 256))
         self.assertEqual(tuple(pool.pool_w2().shape), (32, 128, 64))
@@ -37,7 +37,7 @@ class TestStaticExpertPool(CustomTestCase):
         self.assertEqual(pool.pool_w13().data_ptr(), addr_before)
 
     def test_copy_in_roundtrip(self):
-        pool = StaticExpertPool(_model(), HardwareSpec(), None, num_slots=32)
+        pool = StaticExpertPool(_model(), HardwareSpec(), None, 32)
         # Source tensors must already be pool dtype (fp8) to honor no-alloc.
         w13 = torch.randn(64, 256, dtype=torch.float16).to(torch.float8_e4m3fn)
         w2 = torch.randn(128, 64, dtype=torch.float16).to(torch.float8_e4m3fn)
@@ -49,7 +49,7 @@ class TestStaticExpertPool(CustomTestCase):
         self.assertTrue(torch.equal(got2, w2.float().cpu()))
 
     def test_record_step_flags_pending_copies(self):
-        pool = StaticExpertPool(_model(), HardwareSpec(), None, num_slots=32)
+        pool = StaticExpertPool(_model(), HardwareSpec(), None, 32)
         # No copies issued yet -> not dirty.
         self.assertFalse(pool.record_step())
         pool.copy_in(
@@ -63,7 +63,7 @@ class TestStaticExpertPool(CustomTestCase):
         self.assertFalse(pool.record_step())
 
     def test_precreated_events(self):
-        pool = StaticExpertPool(_model(), HardwareSpec(), None, num_slots=32)
+        pool = StaticExpertPool(_model(), HardwareSpec(), None, 32)
         ev = pool.event_of(0)
         self.assertIsInstance(ev, torch.cuda.Event)
         # Same object reused (pre-created once, not per call).
@@ -83,7 +83,7 @@ class TestCudaTransferBackend(CustomTestCase):
 
         m = _model()
         num_slots = 8
-        pool = StaticExpertPool(m, HardwareSpec(), None, num_slots=num_slots)
+        pool = StaticExpertPool(m, HardwareSpec(), None, num_slots)
         backend = CudaTransferBackend(h2d_bw=25e9)
         backend.set_pool(pool)
 
@@ -149,7 +149,7 @@ class TestEagerDecodeHarness(CustomTestCase):
         # fp32 pool: the harness only exercises hit-rate semantics + copies,
         # not quantized weights (that is Task 7's job). fp8 would force the
         # store to pre-quantize every expert, adding noise to a hit-rate test.
-        pool = StaticExpertPool(m, hw, None, num_slots=num_slots, dtype=torch.float32)
+        pool = StaticExpertPool(m, hw, None, num_slots, dtype=torch.float32)
         backend = CudaTransferBackend(h2d_bw=hw.h2d_bw)
         backend.set_pool(pool)
         cache = ExpertCache(m, hw, make_policy("logitgds", num_slots), backend)
@@ -214,7 +214,7 @@ class TestCapturedDecodeHarness(CustomTestCase):
         hw.vram_bytes = 6 * 1024**3
         hw.h2d_bw = 25e9
 
-        pool = StaticExpertPool(m, hw, None, num_slots=num_slots, dtype=torch.float32)
+        pool = StaticExpertPool(m, hw, None, num_slots, dtype=torch.float32)
         backend = CudaTransferBackend(h2d_bw=hw.h2d_bw)
         backend.set_pool(pool)
         cache = ExpertCache(m, hw, make_policy("logitgds", num_slots), backend)
