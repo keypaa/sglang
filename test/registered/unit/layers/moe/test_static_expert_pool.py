@@ -235,17 +235,17 @@ class TestCapturedDecodeHarness(CustomTestCase):
         pool.wait_all()
 
         # ---- static capture inputs (pre-allocated, no alloc in capture) ----
-        activations = torch.randn(1, 32, device="cuda")
+        activations = torch.randn(32, device="cuda")   # [H] one token
         topk_ids_buf = torch.zeros(1, 4, dtype=torch.int64, device="cuda")
         slot_map_buf = orch.slot_map_tensor().to(dtype=torch.int64, device="cuda")
-        out_buf = torch.zeros(1, 4, 32, device="cuda")
+        out_buf = torch.zeros(4, 32, device="cuda")    # [n, H]
 
         def moe_ffn(w13, w2):
             """Shared FFN: weights already gathered per routed expert."""
-            up = torch.matmul(activations, w13)        # [1, n, 2I]
-            gate, act = up.chunk(2, dim=-1)            # [1, n, I], [1, n, I]
-            mid = gate * torch.nn.functional.gelu(act)  # [1, n, I]
-            return torch.matmul(mid, w2)               # [1, n, H]
+            up = torch.matmul(activations, w13)        # [n, 2I]
+            gate, act = up.chunk(2, dim=-1)            # [n, I], [n, I]
+            mid = gate * torch.nn.functional.gelu(act)  # [n, I]
+            return torch.matmul(mid, w2)               # [n, H]
 
         def fake_decode_forward():
             # Captured: map topk ids -> slot ids via the static slot-map
