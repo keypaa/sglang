@@ -136,7 +136,9 @@ class TestLayerRuntime(CustomTestCase):
         )
         self.assertGreaterEqual(tel["misses"], 1)
         self.assertGreaterEqual(tel["loads"], 1)
-        self.assertGreaterEqual(tel["stall_ms_last"], 0)
+        # Miss path: stall_ms_last is wall time around real copies, so it
+        # must be strictly positive; total subsumes it.
+        self.assertGreater(tel["stall_ms_last"], 0)
         self.assertGreaterEqual(tel["stall_ms_total"], tel["stall_ms_last"])
         loads_after_first = tel["loads"]
         total_after_first = tel["stall_ms_total"]
