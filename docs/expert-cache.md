@@ -117,10 +117,14 @@ Telemetry: each layer's `LayerRuntime.telemetry()` returns
 
 ## Verification status
 
-**GPU-verified: 28 passed / 0 failed** on a Modal L4 (sm_89,
-`lmsysorg/sglang:latest` image). All 28 tests execute on real hardware —
-the 21 CPU tests plus the 7 CUDA-gated ones (pool copy units, backend
-H2D, eager harness, captured-graph harness).
+**GPU gate: 32 passed / 0 failed** on a Modal L4 (sm_89,
+`lmsysorg/sglang:latest` image), including the tiny-model parity gate
+above.
+
+Local suite (no CUDA needed): **41 passed / 9 skipped** across Phase-2
+units plus the Phase-3 server-args, host-store, slot-remap, layer-runtime,
+wiring, and parity tests — the 7 pool-copy CUDA units, the wiring smoke,
+and the parity gate skip locally and execute only on the GPU gate.
 
 CPU-only re-run (no CUDA needed):
 
