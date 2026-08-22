@@ -99,15 +99,23 @@ fail fast at startup):
 - **Eager only**: requires `--disable-cuda-graph` (the router runs inside the
   captured decode graph; graph-safe design is future work).
 - **TP=1 / EP=1** only.
-- **bf16, fused-name checkpoints** of the standard format only (unquantized
-  MoE, no FlashInfer-TRTLLM runner backend; fused shared experts off; no hash
-  layers).
+- **Quantization**: bf16 (unquantized) or **fp8 block-wise** checkpoints
+  (`is_checkpoint_fp8_serialized`, 128×128 `weight_scale_inv` blocks) — on
+  CUDA with the triton MoE runner, where checkpoint layout is compute layout
+  and scales are consumed on-the-fly. Rejected: per-tensor fp8, mxfp8/fp4
+  variants, FlashInfer-TRTLLM format, ROCm/fnuz, deepgemm runner combos,
+  speculative decoding (NextN draft layers unwired), a2a dispatch backends.
+  Split HF names (`gate_proj`/`up_proj`/`down_proj`) are not intercepted —
+  fused-name checkpoints only (loud failure otherwise).
+- **Fused shared experts off** (`--disable-shared-experts-fusion`); no hash
+  layers.
 - **Big-RAM host**: every routed expert's full weight set must fit pinned in
   system RAM (~167 GB for DeepSeek-V4-class models).
 
-Parity gate: `test_deepseek_moe_expert_cache_parity.py` builds a tiny DeepSeek
+Parity gates: `test_deepseek_moe_expert_cache_parity.py` builds a tiny DeepSeek
 MoE twice (dense vs pool-sized + streaming, attention bypassed byte-identical)
-and asserts equal logits — **passes on Modal L4** (32 passed total).
+and asserts equal logits + greedy-token chains — bf16 AND fp8 variants both
+**pass on Modal L4** (53 passed total across the expert-cache GPU suite).
 
 Telemetry: each layer's `LayerRuntime.telemetry()` returns
 
