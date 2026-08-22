@@ -6,7 +6,7 @@ arbitrarily. Pinned memory is mandatory: pageable H2D measured ~3x slower
 """
 from __future__ import annotations
 
-from typing import Dict, NamedTuple
+from typing import Dict, NamedTuple, Optional
 
 import torch
 
@@ -16,6 +16,8 @@ from .types import ExpertKey
 class HostStoreEntry(NamedTuple):
     w13: torch.Tensor
     w2: torch.Tensor
+    w13_scale_inv: Optional[torch.Tensor] = None
+    w2_scale_inv: Optional[torch.Tensor] = None
 
 
 class ExpertHostStore:
@@ -25,15 +27,31 @@ class ExpertHostStore:
         self._entries: Dict[ExpertKey, HostStoreEntry] = {}
         self._total_bytes = 0
 
-    def put(self, key: ExpertKey, w13: torch.Tensor, w2: torch.Tensor) -> None:
+    def put(
+        self,
+        key: ExpertKey,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        w13_scale_inv: Optional[torch.Tensor] = None,
+        w2_scale_inv: Optional[torch.Tensor] = None,
+    ) -> None:
         if key in self._entries:
             raise RuntimeError(f"duplicate expert weight put: {key}")
         if not key.valid() or key.layer >= self._num_layers or key.expert >= self._num_experts:
             raise KeyError(f"key out of range for store: {key}")
-        entry = HostStoreEntry(w13=self._pin(w13), w2=self._pin(w2))
+        entry = HostStoreEntry(
+            w13=self._pin(w13),
+            w2=self._pin(w2),
+            w13_scale_inv=None if w13_scale_inv is None else self._pin(w13_scale_inv),
+            w2_scale_inv=None if w2_scale_inv is None else self._pin(w2_scale_inv),
+        )
         self._entries[key] = entry
         self._total_bytes += entry.w13.numel() * entry.w13.element_size()
         self._total_bytes += entry.w2.numel() * entry.w2.element_size()
+        if entry.w13_scale_inv is not None:
+            self._total_bytes += entry.w13_scale_inv.numel() * entry.w13_scale_inv.element_size()
+        if entry.w2_scale_inv is not None:
+            self._total_bytes += entry.w2_scale_inv.numel() * entry.w2_scale_inv.element_size()
 
     @staticmethod
     def _pin(t: torch.Tensor) -> torch.Tensor:
@@ -48,7 +66,13 @@ class ExpertHostStore:
 
     def expert_bytes(self, key: ExpertKey) -> int:
         e = self._entries[key]
-        return (e.w13.numel() + e.w2.numel()) * e.w13.element_size()
+        total = e.w13.numel() * e.w13.element_size()
+        total += e.w2.numel() * e.w2.element_size()
+        if e.w13_scale_inv is not None:
+            total += e.w13_scale_inv.numel() * e.w13_scale_inv.element_size()
+        if e.w2_scale_inv is not None:
+            total += e.w2_scale_inv.numel() * e.w2_scale_inv.element_size()
+        return total
 
     @property
     def total_bytes(self) -> int:
