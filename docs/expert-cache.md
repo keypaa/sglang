@@ -112,6 +112,46 @@ Known environment caveat (unrelated): 4 sibling tests under
 collect without the full package deps; they are not part of the
 expert-cache suite.
 
+## Performance characterization (Modal L4, PCIe Gen4)
+
+Measured with DeepSeek-V4-Flash shapes (H=3840, I=1536, top_k=6, fp8 expert
+block = 17.7 MB) by `benchmark/moe_expert_cache_bench.py`:
+
+| Measurement | Result |
+|---|---|
+| H2D, pinned, one expert block | **1.45 ms** (~12.2 GB/s achieved) |
+| H2D, pageable | 4.12 ms (~4.3 GB/s) — pin your memory |
+| top-6 burst (pinned) | 8.7 ms |
+| Decode GEMMs, one layer, top-6 | 0.88 ms (launch-bound at batch 1) |
+| Copies + GEMMs, barrier every step | 23.7 ms/iter |
+| Same, pipelined (drain once) | **8.7 ms/iter = the PCIe floor; compute fully hidden** |
+| Orchestrated captured step, all-hit | 3.60 ms (host-overhead dominated) |
+| Orchestrated step with demand misses | 12.1 ms (~0.76 ms stall/miss, ~11 loads/step) |
+
+Simulator sweep (Phase-1 sim, Zipf trace seed 7, per layer): hit rate climbs
+3% → 51% → 83% → **90%** at 8 → 32 → 64 → 128 slots and saturates there;
+slots beyond 128 buy nothing because the residual misses are *cold*
+(first-touch), not capacity misses.
+
+Phase-3 implications:
+
+1. **Plan around ~12 GB/s**, not the assumed 25 GB/s (`HardwareSpec.h2d_bw`
+   should be re-calibrated); a real expert fetch is ~1.45 ms.
+2. **Pinned memory is mandatory** (pageable costs ~3x).
+3. **Never barrier mid-step**: pipelining copies behind compute is the entire
+   ballgame (8.7 vs 23.7 ms). The §5 replay-time-ordering amendment aligns
+   with this.
+4. **Cache sweet spot ≈ half the expert population per layer** (128 of 256
+   slots ≈ 2.3 GB fp8); more VRAM is better spent on KV.
+5. **Host overhead is the next bottleneck**: an all-hit orchestrated step
+   costs 3.6 ms against <1 ms of GPU work — `wait_all`'s double synchronize
+   and per-step `.to()` slot-map refills must be engineered away before
+   integration (persistent device-side slot map, single sync).
+6. Back-of-envelope throughput ceiling on this trace: cold misses/token
+   (~26 across 43 layers) × 1.45 ms ≈ 38 ms/token of unavoidable transfer,
+   partially overlappable — i.e. streaming helps most when locality is high;
+   when it isn't, PCIe is the hard floor.
+
 ## How the pieces were validated
 
 Per-task commits, review findings, and the whole-branch review are captured in
