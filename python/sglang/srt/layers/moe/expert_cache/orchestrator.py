@@ -47,10 +47,14 @@ class StaticPoolOrchestrator:
         # Pinned when CUDA is available so copy_slot_map_into can H2D the map
         # with non_blocking=True — no per-step staging allocation (the .to()
         # refill pattern measured as the dominant all-hit host cost).
+        # device="cpu" is EXPLICIT: an ambient torch.device("cuda") context
+        # would otherwise inject device=cuda into this constructor and pinning
+        # a CUDA tensor raises ("Only dense CPU tensors can be pinned").
         self._slot_map = torch.full(
             (num_layers, num_experts),
             -1,
             dtype=torch.int32,
+            device="cpu",
             pin_memory=torch.cuda.is_available(),
         )
         # The layer whose map slot_map_tensor() exposes (the graph reads one

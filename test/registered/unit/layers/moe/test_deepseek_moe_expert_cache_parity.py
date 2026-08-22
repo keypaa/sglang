@@ -397,8 +397,10 @@ def _fp8_checkpoint_items(model_a):
         s2 = sd[f"model.layers.{i}.mlp.experts.w2_weight_scale_inv"]
         for e in range(_NUM_EXPERTS):
             stem = f"model.layers.{i}.mlp.experts.{e}"
-            q13, gs13 = w13[e], s13[e]
-            q2, gs2 = w2[e], s2[e]
+            # Snapshot eagerly: these must be stable bytes, not live views
+            # into A's CUDA params (A is reloaded right after this).
+            q13, gs13 = w13[e].detach().cpu().clone(), s13[e].detach().cpu().clone()
+            q2, gs2 = w2[e].detach().cpu().clone(), s2[e].detach().cpu().clone()
             half_rows = q13.shape[0] // 2
             row_blocks = gs13.shape[0] // 2
             # B: fused payload+scale names -> interception -> host store.
