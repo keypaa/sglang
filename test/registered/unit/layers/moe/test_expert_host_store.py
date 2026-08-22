@@ -90,5 +90,58 @@ class TestExpertHostStore(CustomTestCase):
         self.assertIsNone(entry.w2_scale_inv)
 
 
+class TestCudaBackendSourceCompat(CustomTestCase):
+    """CudaTransferBackend.load accepts both source shapes (regression)."""
+
+    class _FakeSlot:
+        class node:
+            index = 3
+
+    class _FakePool:
+        def __init__(self):
+            self.copied = None
+
+        def copy_in(self, slot_id, w13, w2):
+            self.copied = (slot_id, w13, w2)
+
+        def wait_all(self):
+            pass
+
+    def _backend(self, pool):
+        from sglang.srt.layers.moe.expert_cache import CudaTransferBackend
+
+        b = CudaTransferBackend(h2d_bw=1e12)
+        b.set_pool(pool)
+        return b
+
+    def test_plain_tuple_source_still_works(self):
+        pool = self._FakePool()
+        b = self._backend(pool)
+        b.set_expert_source(lambda k: (torch.zeros(2, 2), torch.zeros(2, 2)))
+        b.load(ExpertKey(0, 0), 16, self._FakeSlot())
+        self.assertEqual(pool.copied[0], 3)
+
+    def test_host_store_entry_source_unpacks(self):
+        store = ExpertHostStore(1, 2)
+        w13 = torch.zeros(2, 3)
+        w2 = torch.zeros(3, 2)
+        store.put(ExpertKey(0, 0), w13, w2)
+        pool = self._FakePool()
+        b = self._backend(pool)
+        b.set_expert_source(store.get)
+        b.load(ExpertKey(0, 0), 24, self._FakeSlot())
+        self.assertTrue(torch.equal(pool.copied[1], w13))
+        self.assertTrue(torch.equal(pool.copied[2], w2))
+
+    def test_entry_with_scales_raises_clear_error(self):
+        store = ExpertHostStore(1, 2)
+        s = torch.ones(1, 1)
+        store.put(ExpertKey(0, 0), torch.zeros(2, 3), torch.zeros(3, 2), s, s)
+        b = self._backend(self._FakePool())
+        b.set_expert_source(store.get)
+        with self.assertRaises(NotImplementedError):
+            b.load(ExpertKey(0, 0), 24, self._FakeSlot())
+
+
 if __name__ == "__main__":
     unittest.main()

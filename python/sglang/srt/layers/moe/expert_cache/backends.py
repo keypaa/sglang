@@ -152,7 +152,22 @@ class CudaTransferBackend(TransferBackend):
             if on_done is not None:
                 on_done()
             return 0.0
-        w13, w2 = self._expert_source(key)
+        src = self._expert_source(key)
+        # Expert sources may be plain (w13, w2) tuples (Phase-2 harnesses) or
+        # HostStoreEntry namedtuples carrying optional fp8 scale blocks.
+        if hasattr(src, "w13"):
+            w13, w2 = src.w13, src.w2
+            w13_scale, w2_scale = src.w13_scale_inv, src.w2_scale_inv
+        else:
+            w13, w2 = src
+            w13_scale = w2_scale = None
+        if w13_scale is not None or w2_scale is not None:
+            # Scale blocks only make sense for pools that accept them
+            # (RealWeightPool); the Phase-2 StaticExpertPool has none.
+            raise NotImplementedError(
+                "expert source carries scale blocks but this pool does not "
+                "accept them"
+            )
         # slot.node.index == pool slot id (0..capacity-1); no new field.
         self._pool.copy_in(slot.node.index, w13, w2)
         self._moved += nbytes
