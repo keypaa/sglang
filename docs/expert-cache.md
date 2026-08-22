@@ -72,6 +72,49 @@ tests. Phase 2 (HEAD since `16f4bf596`) added the GPU-fast, capture-safe tier:
   updated pool weights.
 - Orchestrator-constructor invariant: `cache capacity == pool.num_slots`.
 
+## Phase 3 milestone 1: wired into DeepSeek MoE (pool-as-weights)
+
+Phase 3 turns the library into a serving path: `DeepseekV2MoE`
+(`models/deepseek_v2.py`) rebuilds its routed-experts layer sized to
+`moe_cache_slots` when the cache is on, so **a pool slot row IS one expert** —
+streaming weights into a slot row is indistinguishable from having loaded the
+model. At `load_weights` time the model intercepts routed-expert fused
+tensors before param loading and diverts them into a pinned host store
+(`ExpertHostStore`); pool rows start uninitialized and are filled on demand.
+Each cache-enabled layer gets a `LayerRuntime` whose `RealWeightPool` adapts
+the real FusedMoE weight params to the pool surface (`copy_in` /
+`record_step` / `wait_all`); the eager forward remaps raw `topk_ids` through
+the static slot map before the MoE kernel runs.
+
+Flags:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--enable-moe-expert-cache` | off | Stream MoE experts from pinned host RAM into a fixed VRAM pool (DeepSeek MoE). |
+| `--moe-cache-slots N` | 128 | Pool slots (= resident experts) per layer; clamped to the routed-expert count. |
+
+Constraints (enforced by `validate_moe_expert_cache` + model-init guards,
+fail fast at startup):
+
+- **Eager only**: requires `--disable-cuda-graph` (the router runs inside the
+  captured decode graph; graph-safe design is future work).
+- **TP=1 / EP=1** only.
+- **bf16, fused-name checkpoints** of the standard format only (unquantized
+  MoE, no FlashInfer-TRTLLM runner backend; fused shared experts off; no hash
+  layers).
+- **Big-RAM host**: every routed expert's full weight set must fit pinned in
+  system RAM (~167 GB for DeepSeek-V4-class models).
+
+Parity gate: `test_deepseek_moe_expert_cache_parity.py` builds a tiny DeepSeek
+MoE twice (dense vs pool-sized + streaming, attention bypassed byte-identical)
+and asserts equal logits — **passes on Modal L4** (32 passed total).
+
+Telemetry: each layer's `LayerRuntime.telemetry()` returns
+
+- `hits`, `misses`, `loads` — from the shared `ExpertCache` stats;
+- `stall_ms_total`, `stall_ms_last` — wall time inside `ensure_resident`
+  while copies were pending; an all-hit call resets `stall_ms_last` to 0.
+
 ## Verification status
 
 **GPU-verified: 28 passed / 0 failed** on a Modal L4 (sm_89,

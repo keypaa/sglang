@@ -124,6 +124,31 @@ class TestLayerRuntime(CustomTestCase):
         pool.wait_all()
         self.assertEqual(pool._sync_count, 0)
 
+    def test_telemetry_miss_then_hit_stall_accounting(self):
+        rt, _cache, _stored = _build()
+
+        # First call: demand miss -> a load happens, stall window recorded.
+        rt.ensure_resident([3])
+        tel = rt.telemetry()
+        self.assertEqual(
+            set(tel),
+            {"hits", "misses", "loads", "stall_ms_total", "stall_ms_last"},
+        )
+        self.assertGreaterEqual(tel["misses"], 1)
+        self.assertGreaterEqual(tel["loads"], 1)
+        self.assertGreaterEqual(tel["stall_ms_last"], 0)
+        self.assertGreaterEqual(tel["stall_ms_total"], tel["stall_ms_last"])
+        loads_after_first = tel["loads"]
+        total_after_first = tel["stall_ms_total"]
+
+        # Second call: all-hit -> no new load, no stall.
+        rt.ensure_resident([3])
+        tel = rt.telemetry()
+        self.assertEqual(tel["loads"], loads_after_first)
+        self.assertEqual(tel["stall_ms_last"], 0)
+        self.assertEqual(tel["stall_ms_total"], total_after_first)
+        self.assertGreaterEqual(tel["hits"], 1)
+
 
 def _build_shared(num_layers):
     """One shared cache + store spanning `num_layers` model layers."""

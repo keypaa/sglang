@@ -8,6 +8,7 @@ surface the orchestrator/backend contract expects (the Phase-2 FakePool:
 """
 from __future__ import annotations
 
+import time
 from typing import Optional, Sequence
 
 import torch
@@ -105,6 +106,11 @@ class LayerRuntime:
         # layers never clobber each other's mappings.
         self.orch = StaticPoolOrchestrator(cache, self.pool, num_experts, num_layers)
         self.device_map = None      # lazily created device mirror (CUDA)
+        # Per-layer stall telemetry: wall time inside ensure_resident while
+        # copies were pending (miss path). stall_ms_last resets to 0 on an
+        # all-hit call; stall_ms_total accumulates across calls.
+        self._stall_ms_total = 0.0
+        self._stall_ms_last = 0.0
         # A real discrete-GPU backend can copy straight into this pool during
         # the cache's own load path; then ensure_resident must not re-copy.
         self._backend_copies = False
@@ -123,17 +129,42 @@ class LayerRuntime:
         # commit discipline): each copy lands before the next acquire, so a
         # mid-batch eviction can never leave a stale map pointing at a slot
         # whose contents belong to a different expert.
+        copies_pending = False
+        t_start = time.perf_counter()
         for eid in dict.fromkeys(int(e) for e in expert_ids):
             key = ExpertKey(self.layer_id, eid)
             resident_before = self.cache.is_resident(key)
             self.orch.on_router_output(self.layer_id, [eid], [0.9], next_ids=[])
             self.orch.step_commit()
-            if not resident_before and not self._backend_copies:
-                slot = self.orch.slot_id_of(self.layer_id, eid)
-                assert slot >= 0, f"no resident slot for expert {eid}"
-                entry = self.store.get(key)
-                self.pool.copy_in(slot, entry.w13, entry.w2)
+            if not resident_before:
+                copies_pending = True
+                if not self._backend_copies:
+                    slot = self.orch.slot_id_of(self.layer_id, eid)
+                    assert slot >= 0, f"no resident slot for expert {eid}"
+                    entry = self.store.get(key)
+                    self.pool.copy_in(slot, entry.w13, entry.w2)
         self.pool.wait_all()
+        if copies_pending:
+            stall_ms = (time.perf_counter() - t_start) * 1000.0
+            self._stall_ms_total += stall_ms
+            self._stall_ms_last = stall_ms
+        else:
+            self._stall_ms_last = 0.0
+
+    def telemetry(self) -> dict:
+        """Per-layer stall/hit snapshot.
+
+        ``hits`` / ``misses`` / ``loads`` come from the shared cache's stats;
+        the stall fields are this layer's own accumulators.
+        """
+        s = self.cache.stats
+        return {
+            "hits": s.hits,
+            "misses": s.misses,
+            "loads": s.loads,
+            "stall_ms_total": self._stall_ms_total,
+            "stall_ms_last": self._stall_ms_last,
+        }
 
     def slot_map_device(self, device) -> torch.Tensor:
         if self.device_map is None:
