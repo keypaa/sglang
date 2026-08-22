@@ -125,7 +125,7 @@ Telemetry: each layer's `LayerRuntime.telemetry()` returns
 
 ## Verification status
 
-**GPU gate: 53 passed / 0 failed** on a Modal L4 (sm_89,
+**GPU gate: 54 passed / 0 failed** on a Modal L4 (sm_89,
 `lmsysorg/sglang:latest` image), including the tiny-model parity gate
 above.
 
