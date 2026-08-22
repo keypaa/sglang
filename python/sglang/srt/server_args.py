@@ -28,6 +28,7 @@ import random
 import socket
 import tempfile
 import uuid
+from types import SimpleNamespace
 from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
@@ -2455,6 +2456,12 @@ class ServerArgs:
         "trivial"
     )
     enable_eplb: A[bool, "Enable EPLB algorithm", NS("exec.moe")] = False
+    enable_moe_expert_cache: A[
+        bool,
+        "Stream MoE experts from pinned host RAM into a fixed VRAM pool (DeepSeek MoE)",
+        NS("exec.moe"),
+    ] = False
+    moe_cache_slots: A[int, "Expert-cache pool slots per layer", NS("exec.moe")] = 128
     eplb_algorithm: A[str, "Chosen EPLB algorithm", NS("exec.moe")] = "auto"
     eplb_rebalance_num_iterations: A[
         int,
@@ -3713,6 +3720,7 @@ class ServerArgs:
         self._handle_legacy_cp_arguments()
         self._validate_prefill_only_disable_kv_cache_args()
         self._handle_dcp_validation()
+        self._handle_moe_expert_cache_validation()
 
         # Model-arch prefill CUDA-graph default must land before cuda-graph
         # resolution (the declarative registry materializes too late to affect
@@ -4030,6 +4038,9 @@ class ServerArgs:
         )
 
         handle_pd_disaggregation(self)
+
+    def _handle_moe_expert_cache_validation(self):
+        validate_moe_expert_cache(self)
 
     def _handle_dcp_validation(self):
         if self.dcp_size < 1:
@@ -9893,6 +9904,38 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
         and is_sm100_supported()
         and not envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.get()
     )
+
+
+def validate_moe_expert_cache(args) -> int:
+    """Validate --enable-moe-expert-cache combos; returns clamped slot count."""
+    if isinstance(args, dict):
+        args = SimpleNamespace(**args)
+    if not args.enable_moe_expert_cache:
+        return 0
+    if not getattr(args, "disable_cuda_graph", False):
+        raise ValueError(
+            "--enable-moe-expert-cache milestone 1 requires "
+            "--disable-cuda-graph (the router runs inside the captured decode "
+            "graph; eager-only until that design lands)."
+        )
+    if getattr(args, "tp_size", 1) > 1 or getattr(args, "ep_size", 1) > 1:
+        raise ValueError(
+            "--enable-moe-expert-cache currently requires tp-size=1 and "
+            "ep-size=1."
+        )
+    if args.moe_cache_slots < 1:
+        raise ValueError("--moe-cache-slots must be >= 1.")
+    # Clamp against the largest plausible routed-expert count; the model layer
+    # re-clamps to config.n_routed_experts at init.
+    n_routed = getattr(args, "moe_num_routed_experts_override", 0) or 256
+    if args.moe_cache_slots > n_routed:
+        logger.warning(
+            "--moe-cache-slots %d > routed experts %d; clamping.",
+            args.moe_cache_slots,
+            n_routed,
+        )
+        return n_routed
+    return args.moe_cache_slots
 
 
 # NOTE: The process-wide ServerArgs is owned by the runtime context
