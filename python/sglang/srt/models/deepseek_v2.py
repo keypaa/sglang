@@ -669,21 +669,71 @@ class DeepseekV2MoE(nn.Module):
             # with fused_shared_experts
             fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)
 
-        self.experts = get_moe_impl_class(quant_config)(
-            num_experts=num_experts_for_moe + get_exec().moe.ep_num_redundant_experts,
-            num_fused_shared_experts=self.num_fused_shared_experts,
-            top_k=top_k_for_moe,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
-            layer_id=self.layer_id,
-            quant_config=quant_config,
-            routed_scaling_factor=self.routed_scaling_factor,
-            routing_method_type=getattr(
-                config, "routing_method_type", RoutingMethodType.DeepSeekV3
-            ),
-            swiglu_limit=getattr(config, "swiglu_limit", None),
-            prefix=add_prefix("experts", prefix),
-        )
+        # Expert cache (pool-as-weights): resolve the mode and enforce guards
+        # BEFORE any FusedMoE exists. FusedMoE.__init__ eagerly allocates its
+        # weight params, so constructing full-size first would transiently
+        # materialize every expert tensor on device; when the cache is on we
+        # build the experts layer sized to the pool instead (no full-size
+        # expert tensor is ever created).
+        _sa = get_server_args()
+        self.expert_cache_enabled = bool(getattr(_sa, "enable_moe_expert_cache", False))
+        if self.expert_cache_enabled:
+            if getattr(config, "num_hash_layers", 0) > 0:
+                raise ValueError("expert cache unsupported with hash layers")
+            if self.num_fused_shared_experts != 0:
+                raise ValueError("expert cache requires fused shared experts off")
+            # Slot remap reads raw topk_ids, so the TopK backend must emit the
+            # standard format. This mirrors the output_format condition used
+            # for the TopK construction below; enforce it here so a cache-on
+            # run fails fast instead of at the first forward.
+            if (
+                quant_config is not None
+            ) or get_moe_runner_backend().is_flashinfer_trtllm():
+                raise ValueError(
+                    "expert cache requires standard-format TopK output "
+                    "(unquantized MoE, non-FlashInfer-TRTLLM runner backend)"
+                )
+            num_slots = min(
+                int(getattr(_sa, "moe_cache_slots", 128)), num_experts_for_moe
+            )
+
+        if self.expert_cache_enabled:
+            # Pool-sized experts: streaming a slot row IS loading an expert.
+            # The shared ExpertCache + LayerRuntime are attached later, once
+            # the host store exists; this only fixes the weight shape.
+            self.experts = get_moe_impl_class(quant_config)(
+                num_experts=num_slots,
+                num_fused_shared_experts=0,
+                top_k=top_k_for_moe,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                layer_id=self.layer_id,
+                quant_config=quant_config,
+                routed_scaling_factor=self.routed_scaling_factor,
+                routing_method_type=getattr(
+                    config, "routing_method_type", RoutingMethodType.DeepSeekV3
+                ),
+                swiglu_limit=getattr(config, "swiglu_limit", None),
+                prefix=add_prefix("experts", prefix),
+            )
+            self.moe_cache_num_slots = num_slots
+        else:
+            self.experts = get_moe_impl_class(quant_config)(
+                num_experts=num_experts_for_moe
+                + get_exec().moe.ep_num_redundant_experts,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                top_k=top_k_for_moe,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                layer_id=self.layer_id,
+                quant_config=quant_config,
+                routed_scaling_factor=self.routed_scaling_factor,
+                routing_method_type=getattr(
+                    config, "routing_method_type", RoutingMethodType.DeepSeekV3
+                ),
+                swiglu_limit=getattr(config, "swiglu_limit", None),
+                prefix=add_prefix("experts", prefix),
+            )
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             self.topk = HashTopK(
@@ -734,49 +784,6 @@ class DeepseekV2MoE(nn.Module):
                     ),
                 )
             self.topk = TopK(**topk_kwargs)
-
-        # Expert cache (pool-as-weights): when enabled, rebuild the experts
-        # layer sized to the pool so streaming a slot row IS loading an
-        # expert. The shared ExpertCache + LayerRuntime are attached later,
-        # once the host store exists; this only fixes the weight shape.
-        _sa = get_server_args()
-        self.expert_cache_enabled = bool(getattr(_sa, "enable_moe_expert_cache", False))
-        if self.expert_cache_enabled:
-            if getattr(config, "num_hash_layers", 0) > 0:
-                raise ValueError("expert cache unsupported with hash layers")
-            if self.num_fused_shared_experts != 0:
-                raise ValueError("expert cache requires fused shared experts off")
-            # Slot remap reads raw topk_ids, so the TopK backend must emit the
-            # standard format. This mirrors the output_format condition used
-            # for the TopK construction above; enforce it here so a cache-on
-            # run fails fast instead of at the first forward.
-            if (
-                quant_config is not None
-            ) or get_moe_runner_backend().is_flashinfer_trtllm():
-                raise ValueError(
-                    "expert cache requires standard-format TopK output "
-                    "(unquantized MoE, non-FlashInfer-TRTLLM runner backend)"
-                )
-            num_slots = min(
-                int(getattr(_sa, "moe_cache_slots", 128)), num_experts_for_moe
-            )
-            # Pool-as-weights: rebuild experts sized to the pool.
-            self.experts = get_moe_impl_class(quant_config)(
-                num_experts=num_slots,
-                num_fused_shared_experts=0,
-                top_k=top_k_for_moe,
-                hidden_size=config.hidden_size,
-                intermediate_size=config.moe_intermediate_size,
-                layer_id=self.layer_id,
-                quant_config=quant_config,
-                routed_scaling_factor=self.routed_scaling_factor,
-                routing_method_type=getattr(
-                    config, "routing_method_type", RoutingMethodType.DeepSeekV3
-                ),
-                swiglu_limit=getattr(config, "swiglu_limit", None),
-                prefix=add_prefix("experts", prefix),
-            )
-            self.moe_cache_num_slots = num_slots
 
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
