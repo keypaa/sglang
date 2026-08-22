@@ -681,7 +681,10 @@ class DeepseekV2MoE(nn.Module):
             if getattr(config, "num_hash_layers", 0) > 0:
                 raise ValueError("expert cache unsupported with hash layers")
             if self.num_fused_shared_experts != 0:
-                raise ValueError("expert cache requires fused shared experts off")
+                raise ValueError(
+                    "expert cache requires fused shared experts off "
+                    "(pass --disable-shared-experts-fusion)"
+                )
             # Slot remap reads raw topk_ids, so the TopK backend must emit the
             # standard format. This mirrors the output_format condition used
             # for the TopK construction below; enforce it here so a cache-on
