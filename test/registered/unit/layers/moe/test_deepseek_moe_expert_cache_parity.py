@@ -379,32 +379,6 @@ def _canonical_non_expert_items(a_state_dict):
     return items
 
 
-def _fp8_canonical_experts():
-    """Deterministic per-expert block-fp8 payloads + scales (canonical bytes).
-
-    Returns {(layer, expert): (w13_q, w13_s, w2_q, w2_s)} on CPU. These bytes
-    seed model A's params DIRECTLY and feed model B through its real
-    interception, so the byte gate compares B's store against the same source
-    of truth from both sides.
-    """
-    gen = torch.Generator().manual_seed(_SEED_WEIGHTS + 7)
-    out = {}
-    for i in range(_NUM_LAYERS):
-        for e in range(_NUM_EXPERTS):
-            bf13 = torch.randn(
-                2 * _FP_INTER, _FP_HIDDEN, generator=gen
-            ) * 0.05
-            bf2 = torch.randn(_FP_HIDDEN, _FP_INTER, generator=gen) * 0.05
-            q13, s13 = per_block_cast_to_fp8(bf13)
-            q2, s2 = per_block_cast_to_fp8(bf2)
-            out[(i, e)] = (q13, s13, q2, s2)
-    return out
-
-
-@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
-class TestTinyModelParityFp8(CustomTestCase):
-
-
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestTinyModelParityFp8(CustomTestCase):
     @classmethod
