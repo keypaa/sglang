@@ -213,6 +213,7 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     is_non_idle_and_non_empty,
+    log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
 )
