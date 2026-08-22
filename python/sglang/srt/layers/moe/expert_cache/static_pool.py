@@ -37,8 +37,8 @@ class StaticExpertPool:
         # Static twin pools: allocated exactly once, at fixed addresses.
         self._w13 = torch.empty((num_slots, *w13_shape), device="cuda", dtype=dtype)
         self._w2 = torch.empty((num_slots, *w2_shape), device="cuda", dtype=dtype)
-        # Pre-created events: one per slot + one reusable step event.
-        self._slot_events = [torch.cuda.Event() for _ in range(num_slots)]
+        # Pre-created event: one reusable per-step barrier (decision-log #2:
+        # a single step event, re-recorded each step — NOT per-slot events).
         self._step_event = torch.cuda.Event()
         # Transfer stream leased once; never created inside capture.
         self._stream = (
@@ -58,9 +58,6 @@ class StaticExpertPool:
     def pool_w2(self) -> torch.Tensor:
         return self._w2
 
-    def event_of(self, slot_id: int) -> torch.cuda.Event:
-        return self._slot_events[slot_id]
-
     def copy_in(self, slot_id: int, w13: torch.Tensor, w2: torch.Tensor) -> None:
         """Async H2D of one expert on the transfer stream. No allocation."""
         assert 0 <= slot_id < self._num_slots
@@ -68,11 +65,9 @@ class StaticExpertPool:
         # in the pool dtype and shape (the pinned expert store provides them).
         assert w13.shape == self._w13[slot_id].shape and w13.dtype == self._dtype
         assert w2.shape == self._w2[slot_id].shape and w2.dtype == self._dtype
-        s = self._stream
-        with torch.cuda.stream(s):
+        with torch.cuda.stream(self._stream):
             self._w13[slot_id].copy_(w13, non_blocking=True)
             self._w2[slot_id].copy_(w2, non_blocking=True)
-        self._slot_events[slot_id].record(s)
         self._pending_copies += 1
 
     def record_step(self) -> bool:
@@ -87,9 +82,14 @@ class StaticExpertPool:
         return True
 
     def wait_all(self) -> None:
-        """Block the host until all in-flight copies complete (tests/shutdown)."""
+        """Block the host until all in-flight copies complete (tests/shutdown).
+
+        Only the transfer stream needs syncing: every pool write goes through
+        it, so once it is drained no later device work anywhere can race a
+        pool read. The previous extra torch.cuda.synchronize() doubled the
+        host stall for nothing (measured: dominates all-hit step latency).
+        """
         self._stream.synchronize()
-        torch.cuda.synchronize()
 
     def step_event(self) -> torch.cuda.Event:
         return self._step_event

@@ -118,6 +118,9 @@ class ExpertCache:
         load path including the busy-victim rule.
         """
         k = choice.key
+        # Record in the shared sketch like acquire(): demand touches count as
+        # reuse evidence for the prefetch ranker too.
+        self._shared_sketch.record(k)
         s = self._index.get(k)
         if s is not None:
             if s.state == SlotState.READY:

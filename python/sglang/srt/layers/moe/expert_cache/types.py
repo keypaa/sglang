@@ -107,7 +107,11 @@ class HardwareSpec:
     Mirrors ``moe::HardwareSpec``."""
 
     vram_bw: float = 936e9  # GB/s : RTX 3090 GDDR6X
-    h2d_bw: float = 25e9  # GB/s : PCIe 4.0 x16 usable host->device
+    # Nominal PCIe 4.0 x16. MEASURED effective pinned H2D on an L4 is
+    # ~12.2e9 (benchmark/moe_expert_cache_bench.py); keep the nominal value
+    # for simulator parity with the C++ reference and override for capacity
+    # planning.
+    h2d_bw: float = 25e9
     host_bw: float = 80e9  # GB/s : DDR5-6000 dual channel
     nvme_bw: float = 7e9  # GB/s : PCIe 4.0 NVMe cold store
     vram_bytes: int = 24 * 1024 * 1024 * 1024  # per-device budget

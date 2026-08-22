@@ -62,12 +62,12 @@ class TestStaticExpertPool(CustomTestCase):
         # Consumed the flag.
         self.assertFalse(pool.record_step())
 
-    def test_precreated_events(self):
+    def test_precreated_step_event(self):
         pool = StaticExpertPool(_model(), HardwareSpec(), None, 32)
-        ev = pool.event_of(0)
+        ev = pool.step_event()
         self.assertIsInstance(ev, torch.cuda.Event)
         # Same object reused (pre-created once, not per call).
-        self.assertIs(pool.event_of(0), ev)
+        self.assertIs(pool.step_event(), ev)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -237,7 +237,11 @@ class TestCapturedDecodeHarness(CustomTestCase):
         # ---- static capture inputs (pre-allocated, no alloc in capture) ----
         activations = torch.randn(32, device="cuda")   # [H] one token
         topk_ids_buf = torch.zeros(1, 4, dtype=torch.int64, device="cuda")
-        slot_map_buf = orch.slot_map_tensor().to(dtype=torch.int64, device="cuda")
+        slot_map_buf = torch.zeros(
+            m.num_experts, dtype=torch.int32, device="cuda"
+        )
+        orch.copy_slot_map_into(slot_map_buf)
+        torch.cuda.synchronize()
         out_buf = torch.zeros(4, 32, device="cuda")    # [n, H]
 
         def moe_ffn(w13, w2):
@@ -301,7 +305,7 @@ class TestCapturedDecodeHarness(CustomTestCase):
             orch.step_commit()
             pool.wait_all()
             topk_ids_buf.copy_(torch.tensor([ids], dtype=torch.int64, device="cuda"))
-            slot_map_buf.copy_(orch.slot_map_tensor().to(dtype=torch.int64, device="cuda"))
+            orch.copy_slot_map_into(slot_map_buf)
             g.replay()
             torch.cuda.synchronize()
             self.assertTrue(torch.allclose(out_buf, eager_reference(ids),

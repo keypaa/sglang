@@ -176,7 +176,9 @@ def bench_orchestrated_steps(
     top_k = m.top_k
     activations = torch.randn(H, device="cuda", dtype=torch.bfloat16)
     topk_ids_buf = torch.zeros(1, top_k, dtype=torch.int64, device="cuda")
-    slot_map_buf = orch.slot_map_tensor().to(dtype=torch.int64, device="cuda")
+    slot_map_buf = torch.zeros(m.num_experts, dtype=torch.int32, device="cuda")
+    orch.copy_slot_map_into(slot_map_buf)
+    torch.cuda.synchronize()
     out_buf = torch.zeros(top_k, H, device="cuda", dtype=torch.bfloat16)
 
     def ffn(w13, w2):
@@ -205,9 +207,7 @@ def bench_orchestrated_steps(
         orch.step_commit()
         pool.wait_all()  # Phase-A replay-time barrier (see spec §5 amendment)
         topk_ids_buf.copy_(torch.tensor([ids], dtype=torch.int64, device="cuda"))
-        slot_map_buf.copy_(
-            orch.slot_map_tensor().to(dtype=torch.int64, device="cuda")
-        )
+        orch.copy_slot_map_into(slot_map_buf)
         g.replay()
         torch.cuda.synchronize()
 

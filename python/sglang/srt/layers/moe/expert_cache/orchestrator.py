@@ -44,8 +44,14 @@ class StaticPoolOrchestrator:
         )
         # Keyed by (layer, expert): each layer owns its own expert id space, so
         # two layers routing the same id must not clobber one slot-map entry.
+        # Pinned when CUDA is available so copy_slot_map_into can H2D the map
+        # with non_blocking=True — no per-step staging allocation (the .to()
+        # refill pattern measured as the dominant all-hit host cost).
         self._slot_map = torch.full(
-            (num_layers, num_experts), -1, dtype=torch.int32
+            (num_layers, num_experts),
+            -1,
+            dtype=torch.int32,
+            pin_memory=torch.cuda.is_available(),
         )
         # The layer whose map slot_map_tensor() exposes (the graph reads one
         # layer's static map per Phase-A instance).
@@ -64,6 +70,11 @@ class StaticPoolOrchestrator:
         ) or any(e >= self._num_experts for e in next_ids):
             raise IndexError("expert id out of range")
 
+        # Defensive: release a stale batch instead of silently leaking its
+        # refcounts (the documented rhythm is on_router_output -> step_commit
+        # per layer; a second call without the commit must not wedge slots).
+        for s in self._held:
+            self._cache.release(s)
         self._held = []
         self._active_layer = layer
         for eid, conf in zip(expert_ids, logit):
@@ -98,6 +109,15 @@ class StaticPoolOrchestrator:
         # gathers by expert id on this single layer's map (one map per
         # Phase-A graph instance).
         return self._slot_map[self._active_layer]
+
+    def copy_slot_map_into(self, dst: torch.Tensor) -> None:
+        """H2D the active layer's map into a device tensor, no allocation.
+
+        The map is pinned (when CUDA is available), so this is a single
+        non_blocking device copy — replaces the per-step
+        `slot_map_tensor().to(dtype, device)` staging alloc.
+        """
+        dst.copy_(self._slot_map[self._active_layer], non_blocking=True)
 
     def slot_id_of(self, layer: int, expert_id: int) -> int:
         if layer < 0 or layer >= self._num_layers:
