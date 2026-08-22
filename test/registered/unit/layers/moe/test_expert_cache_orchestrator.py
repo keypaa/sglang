@@ -117,6 +117,15 @@ class TestOrchestrator(CustomTestCase):
         with self.assertRaises(IndexError):
             orch.on_router_output(0, [99], [0.9], [])
 
+    def test_negative_expert_id_raises(self):
+        # -1 is the slot map's unmapped sentinel; routing it must not wrap to
+        # the last column via negative indexing.
+        pool = FakePool(8)
+        cache = _cache(8)
+        orch = StaticPoolOrchestrator(cache, pool, num_experts=16, num_layers=2)
+        with self.assertRaises(IndexError):
+            orch.on_router_output(0, [-1], [0.9], [])
+
     def test_slot_map_is_keyed_by_layer_not_shared(self):
         # Two layers route the SAME expert id; each layer's map entry must be
         # independent (the graph reads layer L's own map).

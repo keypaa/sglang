@@ -66,8 +66,10 @@ class StaticPoolOrchestrator:
         next_ids: Sequence[int],
     ) -> None:
         if layer >= self._num_layers or any(
-            e >= self._num_experts for e in expert_ids
-        ) or any(e >= self._num_experts for e in next_ids):
+            e < 0 or e >= self._num_experts for e in expert_ids
+        ) or any(e < 0 or e >= self._num_experts for e in next_ids):
+            # Negative ids must be rejected too: -1 is the slot map's unmapped
+            # sentinel, and _slot_map[layer, -1] would silently wrap columns.
             raise IndexError("expert id out of range")
 
         # Defensive: release a stale batch instead of silently leaking its
