@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -132,7 +133,7 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
-from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
     can_cp_split,
     cp_all_gather_rerange_output,
@@ -249,6 +250,26 @@ from sglang.kernels.ops.gemm.fused_a_gemm import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Expert cache (pool-as-weights): routed-expert fused weight tensors are
+# intercepted at load time and routed into the pinned host store instead of
+# the pool-sized device params. Matches only the plain fused weights (no
+# scale suffixes); kind is "w13" (gate+up) or "w2" (down).
+_EXPERT_WEIGHT_NAME_RE = re.compile(r"mlp\.experts\.(\d+)\.(w13_weight|w2_weight)$")
+
+
+def parse_expert_weight_name(name: str) -> Optional[Tuple[int, str]]:
+    """Parse a routed-expert fused weight name into (expert_index, kind).
+
+    Returns (expert_index, "w13"|"w2") for names like
+    ``model.layers.3.mlp.experts.17.w13_weight``; None for anything else
+    (shared experts, attention params, scale suffixes, ...).
+    """
+    match = _EXPERT_WEIGHT_NAME_RE.search(name)
+    if match is None:
+        return None
+    return int(match.group(1)), match.group(2)[: -len("_weight")]
+
 
 # One-time SGLANG_OPT_MOE_QUANT_ONCE engagement log (see _moe_quant_once_enabled).
 _moe_quant_once_logged = False
@@ -725,6 +746,17 @@ class DeepseekV2MoE(nn.Module):
                 raise ValueError("expert cache unsupported with hash layers")
             if self.num_fused_shared_experts != 0:
                 raise ValueError("expert cache requires fused shared experts off")
+            # Slot remap reads raw topk_ids, so the TopK backend must emit the
+            # standard format. This mirrors the output_format condition used
+            # for the TopK construction above; enforce it here so a cache-on
+            # run fails fast instead of at the first forward.
+            if (
+                quant_config is not None
+            ) or get_moe_runner_backend().is_flashinfer_trtllm():
+                raise ValueError(
+                    "expert cache requires standard-format TopK output "
+                    "(unquantized MoE, non-FlashInfer-TRTLLM runner backend)"
+                )
             num_slots = min(
                 int(getattr(_sa, "moe_cache_slots", 128)), num_experts_for_moe
             )
@@ -1167,20 +1199,31 @@ class DeepseekV2MoE(nn.Module):
             )
 
         if self.expert_cache_enabled:
-            # Eager remap: route ids -> pool slot ids. The runtime is
-            # attached by the host-store wiring (Task 6); until then the
-            # layer runs with its (pool-sized but unmanaged) weights.
+            # No half-wired window: pool-sized experts are only safe with
+            # remapped slot ids, so forwarding without an attached runtime
+            # (weights never intercepted at load) must fail loudly instead of
+            # silently gathering out-of-bounds expert rows.
             expert_cache_runtime = getattr(self, "expert_cache_runtime", None)
-            if expert_cache_runtime is not None:
-                from sglang.srt.layers.moe.expert_cache import remap_topk_ids
-
-                ids_host = topk_output.topk_ids.to(torch.long).reshape(-1).tolist()
-                expert_cache_runtime.ensure_resident(sorted(set(ids_host)))
-                slot_ids = remap_topk_ids(
-                    topk_output.topk_ids,
-                    expert_cache_runtime.slot_map_device(topk_output.topk_ids.device),
+            if expert_cache_runtime is None:
+                raise RuntimeError(
+                    f"layer {self.layer_id}: enable_moe_expert_cache is on but "
+                    "no expert-cache runtime is wired; expert weights were not "
+                    "intercepted into the host store at load time"
                 )
-                topk_output = topk_output._replace(topk_ids=slot_ids)
+            if topk_output.format != TopKOutputFormat.STANDARD:
+                raise ValueError(
+                    f"layer {self.layer_id}: expert cache requires "
+                    f"TopKOutputFormat.STANDARD, got {topk_output.format}"
+                )
+            from sglang.srt.layers.moe.expert_cache import remap_topk_ids
+
+            ids_host = topk_output.topk_ids.to(torch.long).reshape(-1).tolist()
+            expert_cache_runtime.ensure_resident(sorted(set(ids_host)))
+            slot_ids = remap_topk_ids(
+                topk_output.topk_ids,
+                expert_cache_runtime.slot_map_device(topk_output.topk_ids.device),
+            )
+            topk_output = topk_output._replace(topk_ids=slot_ids)
 
         if pre_quant_input is not None:
             final_hidden_states = self.experts(
@@ -3197,7 +3240,135 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         return self.model.end_layer
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        # Expert cache: intercept routed-expert fused weights before param
+        # loading so they land in the pinned host store instead of the
+        # pool-sized device params (pool rows start uninitialized).
+        intercept_expert_weights = bool(
+            getattr(get_server_args(), "enable_moe_expert_cache", False)
+        )
+        if intercept_expert_weights:
+            self._moe_expert_cache_infra = None
+            self._moe_expert_cache_pending = {}
+            weights = self._make_expert_cache_interceptor(weights)
         self.do_load_weights(weights, is_nextn)
+        if intercept_expert_weights:
+            self._finish_expert_cache_wiring()
+
+    # ---- expert cache weight interception (load time) ----------------------
+
+    def _make_expert_cache_interceptor(
+        self, weights: Iterable[Tuple[str, torch.Tensor]]
+    ) -> Iterable[Tuple[str, torch.Tensor]]:
+        """Yield non-expert weights unchanged; divert routed-expert fused
+        weights into ``self._moe_expert_cache_pending`` as raw CPU tensors.
+        The shared host store + per-layer runtimes are built lazily on the
+        first intercepted tensor so a flag-on model is never half-wired."""
+
+        def _generator():
+            for name, loaded_weight in weights:
+                parsed = parse_expert_weight_name(name)
+                layer_id = get_layer_id(name)
+                if parsed is None or layer_id is None:
+                    yield name, loaded_weight
+                    continue
+                if not (self.model.start_layer <= layer_id < self.model.end_layer):
+                    continue
+                expert_index, kind = parsed
+                key = (layer_id, expert_index)
+                entry = self._moe_expert_cache_pending.get(key)
+                if entry is None:
+                    entry = {}
+                    self._moe_expert_cache_pending[key] = entry
+                elif kind in entry:
+                    raise ValueError(f"duplicate expert weight in checkpoint: {name}")
+                entry[kind] = loaded_weight.detach().cpu()
+                # Eager wiring: the moment the first expert tensor flows
+                # through, every cache layer has its runtime attached (the
+                # store is filled in bulk after the weight loop).
+                if self._moe_expert_cache_infra is None:
+                    self._build_expert_cache_infra()
+
+        return _generator()
+
+    def _expert_cache_moe_layers(self) -> Iterable["DeepseekV2MoE"]:
+        for layer in self.model.layers[self.model.start_layer : self.model.end_layer]:
+            mlp = getattr(layer, "mlp", None)
+            if isinstance(mlp, DeepseekV2MoE) and mlp.expert_cache_enabled:
+                yield mlp
+
+    def _build_expert_cache_infra(self) -> None:
+        from sglang.srt.layers.moe.expert_cache import (
+            ExpertCache,
+            ExpertHostStore,
+            HardwareSpec,
+            ModelSpec,
+            SimBackend,
+            make_policy,
+        )
+        from sglang.srt.layers.moe.expert_cache.layer_runtime import LayerRuntime
+
+        config = self.config
+        num_layers = config.num_hidden_layers
+        num_experts = config.n_routed_experts
+        num_slots = min(
+            int(getattr(get_server_args(), "moe_cache_slots", 128)), num_experts
+        )
+        spec = ModelSpec(
+            num_layers=num_layers,
+            num_experts=num_experts,
+            top_k=config.num_experts_per_tok,
+            shared_experts=0,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+        )
+        # SimBackend: RealWeightPool performs the actual H2D copies; the
+        # backend only models transfer timing for the cache's virtual clock.
+        cache = ExpertCache(
+            spec, HardwareSpec(), make_policy("logitgds", num_slots), SimBackend(25e9)
+        )
+        store = ExpertHostStore(num_layers=num_layers, num_experts=num_experts)
+        for moe in self._expert_cache_moe_layers():
+            moe.expert_cache_runtime = LayerRuntime(
+                moe.layer_id,
+                cache,
+                store,
+                moe.experts.w13_weight.data,
+                moe.experts.w2_weight.data,
+                num_experts=num_experts,
+                num_layers=num_layers,
+            )
+        self._moe_expert_cache_infra = (cache, store)
+
+    def _finish_expert_cache_wiring(self) -> None:
+        infra = getattr(self, "_moe_expert_cache_infra", None)
+        if infra is None:
+            return  # no routed-expert weights flowed through this shard
+        _, store = infra
+        num_experts = self.config.n_routed_experts
+        for (layer_id, expert_index), entry in sorted(
+            self._moe_expert_cache_pending.items()
+        ):
+            missing = {"w13", "w2"} - set(entry)
+            if missing:
+                raise ValueError(
+                    f"layer {layer_id} expert {expert_index}: checkpoint is "
+                    f"missing fused expert weights {sorted(missing)}"
+                )
+            if expert_index >= num_experts:
+                raise ValueError(
+                    f"layer {layer_id} expert {expert_index} out of range "
+                    f"(n_routed_experts={num_experts})"
+                )
+            # Bulk put AFTER the weight loop so pinning stays off the hot path.
+            from sglang.srt.layers.moe.expert_cache import ExpertKey
+
+            store.put(ExpertKey(layer_id, expert_index), entry["w13"], entry["w2"])
+        self._moe_expert_cache_pending = {}
+        log_info_on_rank0(
+            logger,
+            f"Expert cache: pinned {store.total_bytes / 2**30:.2f} GiB of "
+            "routed-expert weights in host RAM",
+        )
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

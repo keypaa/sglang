@@ -86,6 +86,37 @@ def _build_tiny_test_moe() -> DeepseekV2MoE:
         )
 
 
+class TestParseExpertWeightName(CustomTestCase):
+    def test_matches(self):
+        from sglang.srt.models.deepseek_v2 import parse_expert_weight_name
+
+        self.assertEqual(
+            parse_expert_weight_name("model.layers.3.mlp.experts.17.w13_weight"),
+            (17, "w13"),
+        )
+        self.assertEqual(
+            parse_expert_weight_name("model.layers.3.mlp.experts.0.w2_weight"),
+            (0, "w2"),
+        )
+
+    def test_non_expert_names(self):
+        from sglang.srt.models.deepseek_v2 import parse_expert_weight_name
+
+        self.assertIsNone(
+            parse_expert_weight_name(
+                "model.layers.3.mlp.shared_experts.gate_up_proj.weight"
+            )
+        )
+        self.assertIsNone(
+            parse_expert_weight_name("model.layers.3.self_attn.qkv_proj.weight")
+        )
+        self.assertIsNone(
+            parse_expert_weight_name(
+                "model.layers.3.mlp.experts.17.w13_weight_scale_inv"
+            )
+        )
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestWiringSmoke(CustomTestCase):
     @classmethod
