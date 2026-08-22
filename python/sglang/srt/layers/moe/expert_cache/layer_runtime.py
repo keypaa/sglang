@@ -34,7 +34,15 @@ class RealWeightPool:
         self._stream = transfer_stream or (
             torch.cuda.Stream() if torch.cuda.is_available() else None
         )
+        # Two distinct counters: `_pending` is the copy-batch flag the
+        # orchestrator clears via record_step(); `_inflight` tracks copies that
+        # may still be landing on the transfer stream and is cleared ONLY by an
+        # actual synchronize in wait_all(). Conflating them made wait_all dead
+        # after every step_commit (async CUDA consumers could read rows before
+        # the H2D landed). _sync_count counts real fences (test seam).
         self._pending = 0
+        self._inflight = 0
+        self._sync_count = 0
 
     def copy_in(self, slot_id: int, w13: torch.Tensor, w2: torch.Tensor) -> None:
         assert 0 <= slot_id < self.num_slots
@@ -48,6 +56,7 @@ class RealWeightPool:
             self.w13[slot_id].copy_(w13)
             self.w2[slot_id].copy_(w2)
         self._pending += 1
+        self._inflight += 1
 
     def record_step(self) -> bool:
         if self._pending == 0:
@@ -56,10 +65,12 @@ class RealWeightPool:
         return True
 
     def wait_all(self) -> None:
-        if self._pending == 0:
+        if self._inflight == 0:
             return
         if self._stream is not None:
             self._stream.synchronize()
+        self._inflight = 0
+        self._sync_count += 1
 
 
 class LayerRuntime:
@@ -81,10 +92,17 @@ class LayerRuntime:
         num_experts: int,
         num_layers: int = 1,
     ):
+        assert 0 <= layer_id < num_layers, (
+            f"layer_id {layer_id} out of range for num_layers={num_layers}"
+        )
         self.layer_id = layer_id
         self.pool = RealWeightPool(w13_weight, w2_weight)
         self.cache = cache          # shared across layers
         self.store = store
+        # The orchestrator is keyed by the REAL model layer id so the shared
+        # cache's ExpertKey(layer, expert) space stays coherent with
+        # is_resident()/store.get(); its slot map has one row per layer, so
+        # layers never clobber each other's mappings.
         self.orch = StaticPoolOrchestrator(cache, self.pool, num_experts, num_layers)
         self.device_map = None      # lazily created device mirror (CUDA)
         # A real discrete-GPU backend can copy straight into this pool during
@@ -108,10 +126,10 @@ class LayerRuntime:
         for eid in dict.fromkeys(int(e) for e in expert_ids):
             key = ExpertKey(self.layer_id, eid)
             resident_before = self.cache.is_resident(key)
-            self.orch.on_router_output(0, [eid], [0.9], next_ids=[])
+            self.orch.on_router_output(self.layer_id, [eid], [0.9], next_ids=[])
             self.orch.step_commit()
             if not resident_before and not self._backend_copies:
-                slot = self.orch.slot_id_of(0, eid)
+                slot = self.orch.slot_id_of(self.layer_id, eid)
                 assert slot >= 0, f"no resident slot for expert {eid}"
                 entry = self.store.get(key)
                 self.pool.copy_in(slot, entry.w13, entry.w2)

@@ -95,6 +95,101 @@ class TestLayerRuntime(CustomTestCase):
         # Untouched experts stay unmapped.
         self.assertEqual(int(mirror[0]), -1)
 
+    def test_wait_all_fences_copies_issued_since_record_step(self):
+        rt, _cache, stored = _build()
+        rt.ensure_resident([3])
+        slot = rt.orch.slot_id_of(0, 3)
+        pool = rt.pool
+        syncs_after_ensure = pool._sync_count
+        self.assertGreaterEqual(syncs_after_ensure, 1)
+
+        # A fresh copy issued after the orchestrator's record_step must still
+        # be fenced by wait_all (record_step clears copy-batch state, NOT the
+        # inflight-transfer fence).
+        pool.copy_in(slot, stored[3][0], stored[3][1])
+        self.assertEqual(pool._inflight, 1)
+        pool.record_step()
+        pool.wait_all()
+
+        self.assertEqual(pool._sync_count, syncs_after_ensure + 1)
+        self.assertEqual(pool._inflight, 0)
+
+        # And a no-op wait_all must not fence.
+        pool.wait_all()
+        self.assertEqual(pool._sync_count, syncs_after_ensure + 1)
+
+    def test_wait_all_noop_without_inflight_is_not_a_fence(self):
+        rt, _cache, _stored = _build()
+        pool = rt.pool
+        pool.wait_all()
+        self.assertEqual(pool._sync_count, 0)
+
+
+def _build_shared(num_layers):
+    """One shared cache + store spanning `num_layers` model layers."""
+    torch.manual_seed(0)
+    m = ModelSpec()
+    m.num_layers = num_layers
+    m.num_experts = NUM_EXPERTS
+    m.top_k = 1
+    m.shared_experts = 0
+    cache = ExpertCache(m, HardwareSpec(), make_policy("lru", NUM_SLOTS), SimBackend(1e12))
+
+    store = ExpertHostStore(num_layers=num_layers, num_experts=NUM_EXPERTS)
+    stored = {}
+    for layer in range(num_layers):
+        for e in range(NUM_EXPERTS):
+            w13 = torch.randn(4, 6)
+            w2 = torch.randn(6, 4)
+            store.put(ExpertKey(layer, e), w13, w2)
+            stored[(layer, e)] = (w13, w2)
+    return cache, store, stored
+
+
+class TestLayerRuntimeSharedCache(CustomTestCase):
+    def test_layers_route_distinct_keys_no_collision(self):
+        cache, store, stored = _build_shared(num_layers=2)
+        runtimes = []
+        for layer in range(2):
+            w13_weight = torch.full((NUM_SLOTS, 4, 6), float("nan"))
+            w2_weight = torch.full((NUM_SLOTS, 6, 4), float("nan"))
+            runtimes.append(
+                LayerRuntime(
+                    layer_id=layer,
+                    cache=cache,
+                    store=store,
+                    w13_weight=w13_weight,
+                    w2_weight=w2_weight,
+                    num_experts=NUM_EXPERTS,
+                    num_layers=2,
+                )
+            )
+        rt0, rt1 = runtimes
+
+        rt0.ensure_resident([5])
+        rt1.ensure_resident([5])
+
+        # Same expert id on two layers: distinct cache keys -> two demand
+        # misses (a key collision would serve the second as a hit).
+        self.assertEqual(cache.stats.misses, 2)
+        s0 = rt0.orch.slot_id_of(rt0.layer_id, 5)
+        s1 = rt1.orch.slot_id_of(rt1.layer_id, 5)
+        self.assertGreaterEqual(s0, 0)
+        self.assertGreaterEqual(s1, 0)
+        # Both resident simultaneously => distinct slots.
+        self.assertNotEqual(s0, s1)
+        # Each slot row holds its OWN layer's weights.
+        self.assertTrue(torch.equal(rt0.pool.w13[s0], stored[(0, 5)][0]))
+        self.assertTrue(torch.equal(rt0.pool.w2[s0], stored[(0, 5)][1]))
+        self.assertTrue(torch.equal(rt1.pool.w13[s1], stored[(1, 5)][0]))
+        self.assertTrue(torch.equal(rt1.pool.w2[s1], stored[(1, 5)][1]))
+
+        # Re-routing each layer hits its own key.
+        misses_before = cache.stats.misses
+        rt0.ensure_resident([5])
+        rt1.ensure_resident([5])
+        self.assertEqual(cache.stats.misses, misses_before)
+
 
 if __name__ == "__main__":
     unittest.main()
