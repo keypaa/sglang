@@ -685,6 +685,14 @@ class DeepseekV2MoE(nn.Module):
                     "expert cache requires fused shared experts off "
                     "(pass --disable-shared-experts-fusion)"
                 )
+            # Pool-as-weights is single-rank: an all-to-all dispatch backend
+            # has no role in this MoE, so reject the combination structurally.
+            _a2a = getattr(_sa, "moe_a2a_backend", "none")
+            if _a2a not in (None, "", "none"):
+                raise ValueError(
+                    f"--enable-moe-expert-cache requires --moe-a2a-backend=none "
+                    f"(got {_a2a!r}); expert-cache MoE has no all-to-all dispatch."
+                )
             # Slot remap reads raw topk_ids, so the TopK backend must emit the
             # standard format. This mirrors the output_format condition used
             # for the TopK construction below; enforce it here so a cache-on
