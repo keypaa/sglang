@@ -445,7 +445,10 @@ class TestWiringSmoke(CustomTestCase):
             w2 = torch.randn(hidden, inter).to(torch.float8_e4m3fn)
             w13_scale_inv = torch.rand(2 * inter // 128, hidden // 128)
             w2_scale_inv = torch.rand(hidden // 128, inter // 128)
-            moe._moe_expert_cache_pending = {
+
+            shim = _causal_lm_wiring_shim(moe)
+            # Pending lives on the CausalLM shell (load_weights owns it there).
+            shim._moe_expert_cache_pending = {
                 (0, expert_index): {
                     "w13": w13,
                     "w2": w2,
@@ -453,8 +456,6 @@ class TestWiringSmoke(CustomTestCase):
                     "w2_scale": w2_scale_inv,
                 }
             }
-
-            shim = _causal_lm_wiring_shim(moe)
             shim._build_expert_cache_infra()
             pool = moe.expert_cache_runtime.pool
             # LayerRuntime was threaded the fp8 scale params.
@@ -482,13 +483,13 @@ class TestWiringSmoke(CustomTestCase):
                 quant_config=_fp8_block_quant_config(),
                 prefix="model.layers.0.mlp",
             )
-            moe._moe_expert_cache_pending = {
+            shim = _causal_lm_wiring_shim(moe)
+            shim._moe_expert_cache_pending = {
                 (0, 1): {
                     "w13": torch.randn(256, 256).to(torch.float8_e4m3fn),
                     "w2": torch.randn(256, 128).to(torch.float8_e4m3fn),
                 }
             }
-            shim = _causal_lm_wiring_shim(moe)
             shim._build_expert_cache_infra()
             with self.assertRaises(ValueError) as cm:
                 shim._finish_expert_cache_wiring()

@@ -379,47 +379,30 @@ def _canonical_non_expert_items(a_state_dict):
     return items
 
 
-def _fp8_checkpoint_items(model_a):
-    """Quantize A's post-load expert params per-block; build both item sets.
+def _fp8_canonical_experts():
+    """Deterministic per-expert block-fp8 payloads + scales (canonical bytes).
 
-    A (cache-off) receives production-style split serialized names
-    ({gate,up,down}_proj.weight + .weight_scale_inv) so they route through
-    the real expert_params_mapping into its dense fused fp8 params.
-    B (cache-on) receives fused payload+scale names that flow through its
-    real load_weights interception into the host store.
+    Returns {(layer, expert): (w13_q, w13_s, w2_q, w2_s)} on CPU. These bytes
+    seed model A's params DIRECTLY and feed model B through its real
+    interception, so the byte gate compares B's store against the same source
+    of truth from both sides.
     """
-    sd = model_a.state_dict()
-    items_a, items_b = [], []
+    gen = torch.Generator().manual_seed(_SEED_WEIGHTS + 7)
+    out = {}
     for i in range(_NUM_LAYERS):
-        w13 = sd[f"model.layers.{i}.mlp.experts.w13_weight"]  # [E, 2I, H] fp8
-        s13 = sd[f"model.layers.{i}.mlp.experts.w13_weight_scale_inv"]
-        w2 = sd[f"model.layers.{i}.mlp.experts.w2_weight"]  # [E, H, I] fp8
-        s2 = sd[f"model.layers.{i}.mlp.experts.w2_weight_scale_inv"]
         for e in range(_NUM_EXPERTS):
-            stem = f"model.layers.{i}.mlp.experts.{e}"
-            # Snapshot eagerly: these must be stable bytes, not live views
-            # into A's CUDA params (A is reloaded right after this).
-            q13, gs13 = w13[e].detach().cpu().clone(), s13[e].detach().cpu().clone()
-            q2, gs2 = w2[e].detach().cpu().clone(), s2[e].detach().cpu().clone()
-            half_rows = q13.shape[0] // 2
-            row_blocks = gs13.shape[0] // 2
-            # B: fused payload+scale names -> interception -> host store.
-            items_b.append((f"{stem}.w13_weight", q13))
-            items_b.append((f"{stem}.w13_weight_scale_inv", gs13))
-            items_b.append((f"{stem}.w2_weight", q2))
-            items_b.append((f"{stem}.w2_weight_scale_inv", gs2))
-            # A: production-style split serialized names.
-            items_a.append((f"{stem}.gate_proj.weight", q13[:half_rows]))
-            items_a.append((f"{stem}.up_proj.weight", q13[half_rows:]))
-            items_a.append(
-                (f"{stem}.gate_proj.weight_scale_inv", gs13[:row_blocks])
-            )
-            items_a.append(
-                (f"{stem}.up_proj.weight_scale_inv", gs13[row_blocks:])
-            )
-            items_a.append((f"{stem}.down_proj.weight", q2))
-            items_a.append((f"{stem}.down_proj.weight_scale_inv", gs2))
-    return items_a, items_b
+            bf13 = torch.randn(
+                2 * _FP_INTER, _FP_HIDDEN, generator=gen
+            ) * 0.05
+            bf2 = torch.randn(_FP_HIDDEN, _FP_INTER, generator=gen) * 0.05
+            q13, s13 = per_block_cast_to_fp8(bf13)
+            q2, s2 = per_block_cast_to_fp8(bf2)
+            out[(i, e)] = (q13, s13, q2, s2)
+    return out
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestTinyModelParityFp8(CustomTestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -451,6 +434,10 @@ class TestTinyModelParityFp8(CustomTestCase):
             )
 
     def test_fp8_cached_matches_uncached_logits(self):
+        from sglang.srt.layers.quantization.fp8_utils import (
+            per_block_cast_to_fp8,
+        )
+
         model_a = _build_fp8_model(cache_enabled=False)
         model_b = _build_fp8_model(cache_enabled=True)
 
@@ -472,11 +459,64 @@ class TestTinyModelParityFp8(CustomTestCase):
         with _tp1_parallel(), _server_args(cache_enabled=True):
             model_b.load_weights(common)
 
-        # Expert weights: quantize A's post-load rows once, then feed BOTH
-        # models from those exact bytes (A via split names, B fused).
-        items_a, items_b = _fp8_checkpoint_items(model_a)
-        with _tp1_parallel(), _server_args(cache_enabled=False):
-            model_a.load_weights(items_a)
+        # Expert weights: canonical quantized bytes seeded DIRECTLY into A's
+        # params (A is the reference oracle — no loader roundtrip), while B
+        # receives the SAME bytes as fused checkpoint names through its real
+        # load_weights interception. Any store/A divergence is then a bug in
+        # B's interception or streaming, not a seeding artifact.
+        items_b = []
+        for i in range(_NUM_LAYERS):
+            rows13, rows13s, rows2, rows2s = [], [], [], []
+            for e in range(_NUM_EXPERTS):
+                bf13 = torch.randn(
+                    2 * _FP_INTER, _FP_HIDDEN,
+                    generator=torch.Generator().manual_seed(
+                        _SEED_WEIGHTS + 1000 * i + e
+                    ),
+                ) * 0.05
+                bf2 = torch.randn(
+                    _FP_HIDDEN, _FP_INTER,
+                    generator=torch.Generator().manual_seed(
+                        _SEED_WEIGHTS + 500 + 1000 * i + e
+                    ),
+                ) * 0.05
+                q13, s13 = per_block_cast_to_fp8(bf13)
+                q2, s2 = per_block_cast_to_fp8(bf2)
+                stem = f"model.layers.{i}.mlp.experts.{e}"
+                items_b.extend([
+                    (f"{stem}.w13_weight", q13),
+                    (f"{stem}.w13_weight_scale_inv", s13),
+                    (f"{stem}.w2_weight", q2),
+                    (f"{stem}.w2_weight_scale_inv", s2),
+                ])
+                rows13.append(q13)
+                rows13s.append(s13)
+                rows2.append(q2)
+                rows2s.append(s2)
+
+            with torch.no_grad():
+                sd_a = dict(model_a.state_dict())
+                sd_a[f"model.layers.{i}.mlp.experts.w13_weight"].copy_(
+                    torch.stack(rows13).to(
+                        sd_a[f"model.layers.{i}.mlp.experts.w13_weight"].dtype,
+                        device="cuda",
+                    )
+                )
+                sd_a[
+                    f"model.layers.{i}.mlp.experts.w13_weight_scale_inv"
+                ].copy_(torch.stack(rows13s).to(device="cuda"))
+                sd_a[f"model.layers.{i}.mlp.experts.w2_weight"].copy_(
+                    torch.stack(rows2).to(
+                        sd_a[f"model.layers.{i}.mlp.experts.w2_weight"].dtype,
+                        device="cuda",
+                    )
+                )
+                sd_a[
+                    f"model.layers.{i}.mlp.experts.w2_weight_scale_inv"
+                ].copy_(torch.stack(rows2s).to(device="cuda"))
+
+        # ONE call: each load_weights resets interception infra, so batching
+        # is required for the host store to accumulate every expert.
         with _tp1_parallel(), _server_args(cache_enabled=True):
             model_b.load_weights(items_b)
 
