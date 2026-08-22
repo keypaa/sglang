@@ -2,7 +2,7 @@
 
 import pytest
 
-from sglang.srt.server_args import ServerArgs, validate_moe_expert_cache
+from sglang.srt.server_args import validate_moe_expert_cache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
