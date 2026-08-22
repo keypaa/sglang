@@ -4040,7 +4040,10 @@ class ServerArgs:
         handle_pd_disaggregation(self)
 
     def _handle_moe_expert_cache_validation(self):
-        validate_moe_expert_cache(self)
+        # Persist the validator's clamped slot count so moe_cache_slots
+        # reflects the effective value instead of raw user input.
+        if self.enable_moe_expert_cache:
+            self.moe_cache_slots = validate_moe_expert_cache(self)
 
     def _handle_dcp_validation(self):
         if self.dcp_size < 1:
@@ -9927,7 +9930,7 @@ def validate_moe_expert_cache(args) -> int:
         raise ValueError("--moe-cache-slots must be >= 1.")
     # Clamp against the largest plausible routed-expert count; the model layer
     # re-clamps to config.n_routed_experts at init.
-    n_routed = getattr(args, "moe_num_routed_experts_override", 0) or 256
+    n_routed = 256
     if args.moe_cache_slots > n_routed:
         logger.warning(
             "--moe-cache-slots %d > routed experts %d; clamping.",
