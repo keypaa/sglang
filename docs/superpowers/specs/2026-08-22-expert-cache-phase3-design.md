@@ -132,3 +132,8 @@ tensors after the loader's transform step so `copy_in` is layout-exact.
 4. Phase-2's replay-time ordering amendment carries over unchanged: eager has
    no capture constraints, but the same wait-only-when-pending discipline
    applies.
+5. Milestone-1 parity gate runs on an unquantized (bf16) tiny model: fp8
+   post-load transforms (UE8M0 requant, fnuz normalize, transposes) are
+   layer-global and cannot be applied row-wise to streamed slots. fp8
+   block-wise streaming is the follow-up milestone and needs a layout-exact
+   capture design.
