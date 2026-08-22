@@ -472,8 +472,10 @@ class TestTinyModelParityFp8(CustomTestCase):
                 sd_a = dict(model_a.state_dict())
                 sd_a[f"model.layers.{i}.mlp.experts.w13_weight"].copy_(
                     torch.stack(rows13).to(
-                        sd_a[f"model.layers.{i}.mlp.experts.w13_weight"].dtype,
                         device="cuda",
+                        dtype=sd_a[
+                            f"model.layers.{i}.mlp.experts.w13_weight"
+                        ].dtype,
                     )
                 )
                 sd_a[
@@ -481,8 +483,8 @@ class TestTinyModelParityFp8(CustomTestCase):
                 ].copy_(torch.stack(rows13s).to(device="cuda"))
                 sd_a[f"model.layers.{i}.mlp.experts.w2_weight"].copy_(
                     torch.stack(rows2).to(
-                        sd_a[f"model.layers.{i}.mlp.experts.w2_weight"].dtype,
                         device="cuda",
+                        dtype=sd_a[f"model.layers.{i}.mlp.experts.w2_weight"].dtype,
                     )
                 )
                 sd_a[

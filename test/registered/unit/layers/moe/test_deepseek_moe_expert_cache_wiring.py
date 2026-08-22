@@ -470,10 +470,16 @@ class TestWiringSmoke(CustomTestCase):
 
             shim._finish_expert_cache_wiring()
             entry = moe.expert_cache_runtime.store.get(ExpertKey(0, expert_index))
-            self.assertTrue(torch.equal(entry.w13, w13))
-            self.assertTrue(torch.equal(entry.w2, w2))
-            self.assertTrue(torch.equal(entry.w13_scale_inv, w13_scale_inv))
-            self.assertTrue(torch.equal(entry.w2_scale_inv, w2_scale_inv))
+            # Store entries are pinned-CPU snapshots; the local tensors were
+            # created under a torch.device("cuda") context.
+            self.assertTrue(torch.equal(entry.w13, w13.cpu()))
+            self.assertTrue(torch.equal(entry.w2, w2.cpu()))
+            self.assertTrue(
+                torch.equal(entry.w13_scale_inv, w13_scale_inv.cpu())
+            )
+            self.assertTrue(
+                torch.equal(entry.w2_scale_inv, w2_scale_inv.cpu())
+            )
 
     def test_fp8_entry_without_scales_raises_at_wiring(self):
         with _tp1_parallel(), _cache_server_args(), torch.device("cuda"):
