@@ -3373,10 +3373,12 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             self._moe_expert_cache_infra = None
             self._moe_expert_cache_pending = {}
             weights = self._make_expert_cache_interceptor(weights)
-            try:
-                self.do_load_weights(weights, is_nextn)
+        try:
+            self.do_load_weights(weights, is_nextn)
+            if intercept_expert_weights:
                 self._finish_expert_cache_wiring()
-            finally:
+        finally:
+            if intercept_expert_weights:
                 # A mid-iteration raise would otherwise leave every pinned CPU
                 # copy in the pending store until the next load_weights call.
                 # _finish_expert_cache_wiring clears it on success; this only
