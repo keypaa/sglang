@@ -22,6 +22,7 @@ so any divergence isolates to the expert-cache pool-as-weights path.
 
 import os
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import torch
@@ -32,7 +33,7 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=240, suite="base-a-test-1-gpu-small")
+register_cuda_ci(est_time=360, suite="base-a-test-1-gpu-small")
 
 _NUM_EXPERTS = 8
 _NUM_SLOTS = 4
@@ -58,12 +59,12 @@ def _free_master_port() -> str:
     return port
 
 
-def _tiny_config() -> SimpleNamespace:
+def _tiny_config(hidden=_HIDDEN, inter=_INTER) -> SimpleNamespace:
     return SimpleNamespace(
         architectures=["DeepseekV2ForCausalLM"],
-        hidden_size=_HIDDEN,
-        intermediate_size=_INTER,
-        moe_intermediate_size=_INTER,
+        hidden_size=hidden,
+        intermediate_size=inter,
+        moe_intermediate_size=inter,
         n_routed_experts=_NUM_EXPERTS,
         num_experts_per_tok=_TOP_K,
         n_shared_experts=None,
@@ -121,6 +122,18 @@ def _server_args(cache_enabled: bool):
         disable_shared_experts_fusion=True,
         ep_num_redundant_experts=0,
     )
+
+
+@contextmanager
+def _bf16_default_dtype():
+    # Quantized models must be BORN in their final dtypes: Module.to(bf16)
+    # would upcast fp8 weight params and destroy the quantized layout.
+    prev = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(prev)
 
 
 def _build_model(cache_enabled: bool) -> DeepseekV2ForCausalLM:
@@ -304,6 +317,209 @@ class TestTinyModelParity(CustomTestCase):
             matched,
             _MIN_MATCHED_TOKENS,
             f"greedy continuations diverged: {matched}/{total} argmax tokens equal",
+        )
+
+
+# ---------------------------------------------------------------------------
+# fp8 block-quant parity (M2 gate): same contract as above, but both models
+# carry block-fp8 experts and the streamed bytes include weight_scale_inv.
+# ---------------------------------------------------------------------------
+
+_FP_HIDDEN = 128
+_FP_INTER = 128  # 128-multiples => scale blocks slice cleanly at the gate/up seam
+
+
+def _fp8_quant_config():
+    from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+    return Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+        weight_block_size=[128, 128],
+    )
+
+
+def _build_fp8_model(cache_enabled: bool) -> DeepseekV2ForCausalLM:
+    # Quantized models must be BORN in their final dtypes: a post-hoc .to()
+    # would upcast fp8 payload params and destroy the quantized layout.
+    torch.manual_seed(_SEED_WEIGHTS)
+    with (
+        _bf16_default_dtype(),
+        _tp1_parallel(),
+        _server_args(cache_enabled),
+        torch.device("cuda"),
+    ):
+        return DeepseekV2ForCausalLM(
+            config=_tiny_config(hidden=_FP_HIDDEN, inter=_FP_INTER),
+            quant_config=_fp8_quant_config(),
+            prefix="",
+        )
+
+
+def _canonical_non_expert_items(a_state_dict):
+    """Deterministic bf16 tensors for every non-expert param name."""
+    items = []
+    for name, t in sorted(a_state_dict.items()):
+        if ".mlp.experts." in name:
+            continue
+        items.append((name, torch.randn(t.shape, dtype=t.dtype)))
+    return items
+
+
+def _fp8_checkpoint_items(model_a):
+    """Quantize A's post-load expert params per-block; build both item sets.
+
+    A (cache-off) receives production-style split serialized names
+    ({gate,up,down}_proj.weight + .weight_scale_inv) so they route through
+    the real expert_params_mapping into its dense fused fp8 params.
+    B (cache-on) receives fused payload+scale names that flow through its
+    real load_weights interception into the host store.
+    """
+    sd = model_a.state_dict()
+    items_a, items_b = [], []
+    for i in range(_NUM_LAYERS):
+        w13 = sd[f"model.layers.{i}.mlp.experts.w13_weight"]  # [E, 2I, H] fp8
+        s13 = sd[f"model.layers.{i}.mlp.experts.w13_weight_scale_inv"]
+        w2 = sd[f"model.layers.{i}.mlp.experts.w2_weight"]  # [E, H, I] fp8
+        s2 = sd[f"model.layers.{i}.mlp.experts.w2_weight_scale_inv"]
+        for e in range(_NUM_EXPERTS):
+            stem = f"model.layers.{i}.mlp.experts.{e}"
+            q13, gs13 = w13[e], s13[e]
+            q2, gs2 = w2[e], s2[e]
+            half_rows = q13.shape[0] // 2
+            row_blocks = gs13.shape[0] // 2
+            # B: fused payload+scale names -> interception -> host store.
+            items_b.append((f"{stem}.w13_weight", q13))
+            items_b.append((f"{stem}.w13_weight_scale_inv", gs13))
+            items_b.append((f"{stem}.w2_weight", q2))
+            items_b.append((f"{stem}.w2_weight_scale_inv", gs2))
+            # A: production-style split serialized names.
+            items_a.append((f"{stem}.gate_proj.weight", q13[:half_rows]))
+            items_a.append((f"{stem}.up_proj.weight", q13[half_rows:]))
+            items_a.append(
+                (f"{stem}.gate_proj.weight_scale_inv", gs13[:row_blocks])
+            )
+            items_a.append(
+                (f"{stem}.up_proj.weight_scale_inv", gs13[row_blocks:])
+            )
+            items_a.append((f"{stem}.down_proj.weight", q2))
+            items_a.append((f"{stem}.down_proj.weight_scale_inv", gs2))
+    return items_a, items_b
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestTinyModelParityFp8(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", _free_master_port())
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        os.environ.setdefault("LOCAL_RANK", "0")
+
+        from sglang.srt.distributed.parallel_state import (
+            init_distributed_environment,
+            initialize_model_parallel,
+            model_parallel_is_initialized,
+        )
+
+        if not torch.distributed.is_initialized():
+            init_distributed_environment(
+                world_size=1, rank=0, local_rank=0, backend="gloo"
+            )
+        if not model_parallel_is_initialized():
+            initialize_model_parallel(
+                tensor_model_parallel_size=1,
+                expert_model_parallel_size=1,
+                pipeline_model_parallel_size=1,
+                backend="gloo",
+            )
+
+    def test_fp8_cached_matches_uncached_logits(self):
+        model_a = _build_fp8_model(cache_enabled=False)
+        model_b = _build_fp8_model(cache_enabled=True)
+
+        # Pool-as-weights took effect on B only; A keeps full-size experts.
+        self.assertFalse(model_a.model.layers[0].mlp.expert_cache_enabled)
+        self.assertTrue(model_b.model.layers[0].mlp.expert_cache_enabled)
+        self.assertEqual(
+            model_a.model.layers[0].mlp.experts.w13_weight.shape[0],
+            _NUM_EXPERTS,
+        )
+        self.assertEqual(
+            model_b.model.layers[0].mlp.experts.w13_weight.shape[0], _NUM_SLOTS
+        )
+
+        # Seed non-expert params identically through each model's own loader.
+        common = _canonical_non_expert_items(model_a.state_dict())
+        with _tp1_parallel(), _server_args(cache_enabled=False):
+            model_a.load_weights(common)
+        with _tp1_parallel(), _server_args(cache_enabled=True):
+            model_b.load_weights(common)
+
+        # Expert weights: quantize A's post-load rows once, then feed BOTH
+        # models from those exact bytes (A via split names, B fused).
+        items_a, items_b = _fp8_checkpoint_items(model_a)
+        with _tp1_parallel(), _server_args(cache_enabled=False):
+            model_a.load_weights(items_a)
+        with _tp1_parallel(), _server_args(cache_enabled=True):
+            model_b.load_weights(items_b)
+
+        # Byte gate BEFORE tolerance: every store entry must be bitwise-equal
+        # to A's post-load fp8 params — payloads AND scales.
+        sd_a = model_a.state_dict()
+        for i, layer in enumerate(model_b.model.layers):
+            runtime = getattr(layer.mlp, "expert_cache_runtime", None)
+            self.assertIsNotNone(runtime)
+            ref13 = sd_a[f"model.layers.{i}.mlp.experts.w13_weight"]
+            ref13s = sd_a[
+                f"model.layers.{i}.mlp.experts.w13_weight_scale_inv"
+            ]
+            ref2 = sd_a[f"model.layers.{i}.mlp.experts.w2_weight"]
+            ref2s = sd_a[f"model.layers.{i}.mlp.experts.w2_weight_scale_inv"]
+            for e in range(_NUM_EXPERTS):
+                entry = runtime.store.get(ExpertKey(i, e))
+                for got, want, what in (
+                    (entry.w13, ref13[e], "w13"),
+                    (entry.w13_scale_inv, ref13s[e], "w13_scale"),
+                    (entry.w2, ref2[e], "w2"),
+                    (entry.w2_scale_inv, ref2s[e], "w2_scale"),
+                ):
+                    self.assertIsNotNone(got, f"missing {what} (layer {i})")
+                    self.assertTrue(
+                        torch.equal(got.cpu(), want.cpu()),
+                        f"store {what} bytes != checkpoint bytes "
+                        f"(layer {i}, expert {e})",
+                    )
+
+        # Parity: identical tokens -> identical logits -> matching greedy chain.
+        model_a.eval()
+        model_b.eval()
+        with torch.no_grad():
+            torch.manual_seed(_SEED_TOKENS)
+            tokens_a = torch.randint(0, _VOCAB, (_BATCH,), device="cuda")
+            tokens_b = tokens_a.clone()
+            matched = 0
+            total = 0
+            for step in range(_GREEDY_STEPS):
+                logits_a = _moe_stack_logits(model_a, tokens_a)
+                logits_b = _moe_stack_logits(model_b, tokens_b)
+                self.assertEqual(logits_a.shape, logits_b.shape)
+                self.assertTrue(
+                    torch.allclose(logits_a, logits_b, atol=2e-2, rtol=2e-2),
+                    f"fp8 logits diverge at step {step}: max abs diff "
+                    f"{(logits_a - logits_b).abs().max().item():.3e}",
+                )
+                next_a = logits_a.argmax(dim=-1)
+                next_b = logits_b.argmax(dim=-1)
+                matched += int((next_a == next_b).sum())
+                total += next_a.numel()
+                tokens_a = next_a
+                tokens_b = next_b
+        self.assertGreaterEqual(
+            matched,
+            _MIN_MATCHED_TOKENS,
+            f"fp8 greedy continuations diverged: {matched}/{total} equal",
         )
 
 
