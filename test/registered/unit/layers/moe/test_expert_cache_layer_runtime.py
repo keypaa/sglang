@@ -24,14 +24,14 @@ NUM_SLOTS = 4
 NUM_EXPERTS = 8
 
 
-def _build(layer_id=0):
+def _build(layer_id=0, num_slots=NUM_SLOTS):
     torch.manual_seed(0)
     m = ModelSpec()
     m.num_layers = 1
     m.num_experts = NUM_EXPERTS
     m.top_k = 1
     m.shared_experts = 0
-    cache = ExpertCache(m, HardwareSpec(), make_policy("lru", NUM_SLOTS), SimBackend(1e12))
+    cache = ExpertCache(m, HardwareSpec(), make_policy("lru", num_slots), SimBackend(1e12))
 
     store = ExpertHostStore(num_layers=1, num_experts=NUM_EXPERTS)
     stored = {}
@@ -42,8 +42,8 @@ def _build(layer_id=0):
         stored[e] = (w13, w2)
 
     # Slot-major device weight tensors for a FusedMoE layer.
-    w13_weight = torch.full((NUM_SLOTS, 4, 6), float("nan"))
-    w2_weight = torch.full((NUM_SLOTS, 6, 4), float("nan"))
+    w13_weight = torch.full((num_slots, 4, 6), float("nan"))
+    w2_weight = torch.full((num_slots, 6, 4), float("nan"))
 
     rt = LayerRuntime(
         layer_id=layer_id,
@@ -150,6 +150,42 @@ class TestLayerRuntime(CustomTestCase):
         self.assertEqual(tel["stall_ms_last"], 0)
         self.assertEqual(tel["stall_ms_total"], total_after_first)
         self.assertGreaterEqual(tel["hits"], 1)
+
+    def test_eviction_reload_pool_rows_byte_match_store(self):
+        # Two slots over eight experts forces real evictions. After each
+        # residency call, every currently mapped expert must own a slot whose
+        # pool rows are BYTE-equal to the host-store weights — the
+        # pool-row<->store gate applied post-residency (CPU, stream=None).
+        rt, _cache, stored = _build(num_slots=2)
+
+        rt.ensure_resident([0, 1])
+        rt.ensure_resident([2, 3])  # evicts 0 and 1
+
+        for e in (2, 3):
+            slot = rt.orch.slot_id_of(0, e)
+            self.assertGreaterEqual(slot, 0)
+            self.assertTrue(
+                torch.equal(rt.pool.w13[slot], stored[e][0]),
+                f"pool w13 row != store bytes post-eviction (expert {e})",
+            )
+            self.assertTrue(
+                torch.equal(rt.pool.w2[slot], stored[e][1]),
+                f"pool w2 row != store bytes post-eviction (expert {e})",
+            )
+
+        # Reload after eviction: re-routing expert 0 must land its exact
+        # store bytes in a pool row again.
+        rt.ensure_resident([0])
+        slot0 = rt.orch.slot_id_of(0, 0)
+        self.assertGreaterEqual(slot0, 0)
+        self.assertTrue(
+            torch.equal(rt.pool.w13[slot0], stored[0][0]),
+            "reloaded expert 0: pool w13 row != store bytes",
+        )
+        self.assertTrue(
+            torch.equal(rt.pool.w2[slot0], stored[0][1]),
+            "reloaded expert 0: pool w2 row != store bytes",
+        )
 
 
 def _build_shared(num_layers):
