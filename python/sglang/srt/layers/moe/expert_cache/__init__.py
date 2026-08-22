@@ -24,6 +24,7 @@ from .policies import (
     make_policy,
 )
 from .simulator import SimResult, TraceGenerator, run_simulation
+from .slot_remap import remap_topk_ids
 from .static_pool import StaticExpertPool
 from .types import (
     CacheStats,
@@ -59,5 +60,6 @@ __all__ = [
     "TraceGenerator",
     "TransferBackend",
     "make_policy",
+    "remap_topk_ids",
     "run_simulation",
 ]
