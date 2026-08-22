@@ -125,8 +125,8 @@ block = 17.7 MB) by `benchmark/moe_expert_cache_bench.py`:
 | Decode GEMMs, one layer, top-6 | 0.88 ms (launch-bound at batch 1) |
 | Copies + GEMMs, barrier every step | 23.7 ms/iter |
 | Same, pipelined (drain once) | **8.7 ms/iter = the PCIe floor; compute fully hidden** |
-| Orchestrated captured step, all-hit | 3.60 ms (host-overhead dominated) |
-| Orchestrated step with demand misses | 12.1 ms (~0.76 ms stall/miss, ~11 loads/step) |
+| Orchestrated captured step, all-hit | 3.38 ms (host/harness-bound) |
+| Orchestrated step with demand misses | 8.1 ms (~0.42 ms stall/miss, ~11 loads/step) |
 
 Simulator sweep (Phase-1 sim, Zipf trace seed 7, per layer): hit rate climbs
 3% → 51% → 83% → **90%** at 8 → 32 → 64 → 128 slots and saturates there;
@@ -143,10 +143,13 @@ Phase-3 implications:
    with this.
 4. **Cache sweet spot ≈ half the expert population per layer** (128 of 256
    slots ≈ 2.3 GB fp8); more VRAM is better spent on KV.
-5. **Host overhead is the next bottleneck**: an all-hit orchestrated step
-   costs 3.6 ms against <1 ms of GPU work — `wait_all`'s double synchronize
-   and per-step `.to()` slot-map refills must be engineered away before
-   integration (persistent device-side slot map, single sync).
+5. **Host overhead was the next bottleneck — largely fixed**: the hot path
+   now syncs the transfer stream only when copies are pending, uses a pinned
+   slot map with a single non_blocking H2D refill (`copy_slot_map_into`),
+   and no longer records an unconsumed event per copy. Demand-miss steps
+   dropped 12.1 → 8.1 ms (stall/miss 761 → 422 µs). The residual all-hit
+   step cost is harness-side (per-step `torch.tensor(..., device="cuda")`
+   + full-device synchronize), not library-side.
 6. Back-of-envelope throughput ceiling on this trace: cold misses/token
    (~26 across 43 layers) × 1.45 ms ≈ 38 ms/token of unavoidable transfer,
    partially overlappable — i.e. streaming helps most when locality is high;
