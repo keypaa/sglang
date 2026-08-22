@@ -714,6 +714,38 @@ class DeepseekV2MoE(nn.Module):
                 )
             self.topk = TopK(**topk_kwargs)
 
+        # Expert cache (pool-as-weights): when enabled, rebuild the experts
+        # layer sized to the pool so streaming a slot row IS loading an
+        # expert. The shared ExpertCache + LayerRuntime are attached later,
+        # once the host store exists; this only fixes the weight shape.
+        _sa = get_server_args()
+        self.expert_cache_enabled = bool(getattr(_sa, "enable_moe_expert_cache", False))
+        if self.expert_cache_enabled:
+            if getattr(config, "num_hash_layers", 0) > 0:
+                raise ValueError("expert cache unsupported with hash layers")
+            if self.num_fused_shared_experts != 0:
+                raise ValueError("expert cache requires fused shared experts off")
+            num_slots = min(
+                int(getattr(_sa, "moe_cache_slots", 128)), num_experts_for_moe
+            )
+            # Pool-as-weights: rebuild experts sized to the pool.
+            self.experts = get_moe_impl_class(quant_config)(
+                num_experts=num_slots,
+                num_fused_shared_experts=0,
+                top_k=top_k_for_moe,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                layer_id=self.layer_id,
+                quant_config=quant_config,
+                routed_scaling_factor=self.routed_scaling_factor,
+                routing_method_type=getattr(
+                    config, "routing_method_type", RoutingMethodType.DeepSeekV3
+                ),
+                swiglu_limit=getattr(config, "swiglu_limit", None),
+                prefix=add_prefix("experts", prefix),
+            )
+            self.moe_cache_num_slots = num_slots
+
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
@@ -1133,6 +1165,22 @@ class DeepseekV2MoE(nn.Module):
             post_combine_hook_handle = (
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
+
+        if self.expert_cache_enabled:
+            # Eager remap: route ids -> pool slot ids. The runtime is
+            # attached by the host-store wiring (Task 6); until then the
+            # layer runs with its (pool-sized but unmanaged) weights.
+            expert_cache_runtime = getattr(self, "expert_cache_runtime", None)
+            if expert_cache_runtime is not None:
+                from sglang.srt.layers.moe.expert_cache import remap_topk_ids
+
+                ids_host = topk_output.topk_ids.to(torch.long).reshape(-1).tolist()
+                expert_cache_runtime.ensure_resident(sorted(set(ids_host)))
+                slot_ids = remap_topk_ids(
+                    topk_output.topk_ids,
+                    expert_cache_runtime.slot_map_device(topk_output.topk_ids.device),
+                )
+                topk_output = topk_output._replace(topk_ids=slot_ids)
 
         if pre_quant_input is not None:
             final_hidden_states = self.experts(
