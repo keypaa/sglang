@@ -253,22 +253,34 @@ logger = logging.getLogger(__name__)
 
 # Expert cache (pool-as-weights): routed-expert fused weight tensors are
 # intercepted at load time and routed into the pinned host store instead of
-# the pool-sized device params. Matches only the plain fused weights (no
-# scale suffixes); kind is "w13" (gate+up) or "w2" (down).
-_EXPERT_WEIGHT_NAME_RE = re.compile(r"mlp\.experts\.(\d+)\.(w13_weight|w2_weight)$")
+# the pool-sized device params. Matches the plain fused weights (kind "w13"
+# for gate+up, "w2" for down) and their fp8 per-tensor scale_inv tensors
+# (kinds "w13_scale" / "w2_scale").
+_EXPERT_WEIGHT_NAME_RE = re.compile(
+    r"mlp\.experts\.(\d+)\.(w13_weight|w2_weight|w13_weight_scale_inv|w2_weight_scale_inv)$"
+)
+
+_EXPERT_WEIGHT_KIND_BY_SUFFIX = {
+    "w13_weight": "w13",
+    "w2_weight": "w2",
+    "w13_weight_scale_inv": "w13_scale",
+    "w2_weight_scale_inv": "w2_scale",
+}
 
 
 def parse_expert_weight_name(name: str) -> Optional[Tuple[int, str]]:
     """Parse a routed-expert fused weight name into (expert_index, kind).
 
     Returns (expert_index, "w13"|"w2") for names like
-    ``model.layers.3.mlp.experts.17.w13_weight``; None for anything else
-    (shared experts, attention params, scale suffixes, ...).
+    ``model.layers.3.mlp.experts.17.w13_weight`` and
+    (expert_index, "w13_scale"|"w2_scale") for their fp8
+    ``*_weight_scale_inv`` tensors; None for anything else (shared experts,
+    attention params, non-inv scale suffixes, ...).
     """
     match = _EXPERT_WEIGHT_NAME_RE.search(name)
     if match is None:
         return None
-    return int(match.group(1)), match.group(2)[: -len("_weight")]
+    return int(match.group(1)), _EXPERT_WEIGHT_KIND_BY_SUFFIX[match.group(2)]
 
 
 # One-time SGLANG_OPT_MOE_QUANT_ONCE engagement log (see _moe_quant_once_enabled).

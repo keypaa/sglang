@@ -111,6 +111,18 @@ class TestParseExpertWeightName(CustomTestCase):
             parse_expert_weight_name("model.layers.3.mlp.experts.0.w2_weight"),
             (0, "w2"),
         )
+        self.assertEqual(
+            parse_expert_weight_name(
+                "model.layers.3.mlp.experts.17.w13_weight_scale_inv"
+            ),
+            (17, "w13_scale"),
+        )
+        self.assertEqual(
+            parse_expert_weight_name(
+                "model.layers.3.mlp.experts.0.w2_weight_scale_inv"
+            ),
+            (0, "w2_scale"),
+        )
 
     def test_non_expert_names(self):
         from sglang.srt.models.deepseek_v2 import parse_expert_weight_name
@@ -124,9 +136,10 @@ class TestParseExpertWeightName(CustomTestCase):
             parse_expert_weight_name("model.layers.3.self_attn.qkv_proj.weight")
         )
         self.assertIsNone(
-            parse_expert_weight_name(
-                "model.layers.3.mlp.experts.17.w13_weight_scale_inv"
-            )
+            parse_expert_weight_name("model.layers.3.mlp.experts.17.w13_weight_scale")
+        )
+        self.assertIsNone(
+            parse_expert_weight_name("model.layers.3.mlp.experts.17.w2_weight_scale")
         )
 
 
