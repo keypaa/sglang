@@ -29,6 +29,16 @@ _HIDDEN = 32
 _INTER = 32
 
 
+def _free_master_port() -> str:
+    import socket
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = str(s.getsockname()[1])
+    s.close()
+    return port
+
+
 def _tiny_config() -> SimpleNamespace:
     # Minimal DeepseekV2Config-like namespace for DeepseekV2MoE.__init__.
     return SimpleNamespace(
@@ -128,7 +138,7 @@ class TestWiringSmoke(CustomTestCase):
         # (use_symmetric_memory(get_tp_group(), ...)), so a bare module
         # forward needs a minimal single-rank world.
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", "29633")
+        os.environ.setdefault("MASTER_PORT", _free_master_port())
         os.environ.setdefault("RANK", "0")
         os.environ.setdefault("WORLD_SIZE", "1")
         os.environ.setdefault("LOCAL_RANK", "0")

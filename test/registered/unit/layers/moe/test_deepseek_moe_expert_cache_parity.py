@@ -48,6 +48,16 @@ _SEED_WEIGHTS = 1234
 _SEED_TOKENS = 42
 
 
+def _free_master_port() -> str:
+    import socket
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = str(s.getsockname()[1])
+    s.close()
+    return port
+
+
 def _tiny_config() -> SimpleNamespace:
     return SimpleNamespace(
         architectures=["DeepseekV2ForCausalLM"],
@@ -197,7 +207,7 @@ class TestTinyModelParity(CustomTestCase):
         # Minimal single-rank world: FusedMoE.forward_impl reads the TP
         # process group unconditionally via use_symmetric_memory.
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", "29641")
+        os.environ.setdefault("MASTER_PORT", _free_master_port())
         os.environ.setdefault("RANK", "0")
         os.environ.setdefault("WORLD_SIZE", "1")
         os.environ.setdefault("LOCAL_RANK", "0")
