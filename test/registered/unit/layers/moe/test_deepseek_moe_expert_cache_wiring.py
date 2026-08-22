@@ -77,7 +77,10 @@ def _cache_server_args():
 
 
 def _build_tiny_test_moe() -> DeepseekV2MoE:
-    with _tp1_parallel(), _cache_server_args():
+    # torch.device("cuda") places every created param on GPU; forward_normal
+    # feeds CUDA hidden states through the gate, which would otherwise hit a
+    # cpu-vs-cuda matmul error.
+    with _tp1_parallel(), _cache_server_args(), torch.device("cuda"):
         return DeepseekV2MoE(
             config=_tiny_config(),
             layer_id=0,
