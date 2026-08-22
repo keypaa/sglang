@@ -24,6 +24,37 @@ NUM_SLOTS = 4
 NUM_EXPERTS = 8
 
 
+def _gate_pool_rows_match(case, pool, slot, w13, w2, w13_scale_inv=None,
+                          w2_scale_inv=None):
+    """Residency byte-gate extended to scales: every pool row owned by `slot`
+    must be BYTE-equal to the host-store entry — weight rows always, scale
+    rows whenever the entry carries scales. Pool scale-param presence must
+    mirror the entry's (a pool with params can never hold a scale-less expert
+    and vice versa without breaking the quantization contract)."""
+    case.assertTrue(
+        torch.equal(pool.w13[slot], w13),
+        f"pool w13 row != store bytes (slot {slot})",
+    )
+    case.assertTrue(
+        torch.equal(pool.w2[slot], w2),
+        f"pool w2 row != store bytes (slot {slot})",
+    )
+    case.assertEqual(pool.w13_scale is None, w13_scale_inv is None,
+                     "pool/entry w13 scale-presence mismatch")
+    case.assertEqual(pool.w2_scale is None, w2_scale_inv is None,
+                     "pool/entry w2 scale-presence mismatch")
+    if w13_scale_inv is not None:
+        case.assertTrue(
+            torch.equal(pool.w13_scale[slot], w13_scale_inv),
+            f"pool w13 scale row != store bytes (slot {slot})",
+        )
+    if w2_scale_inv is not None:
+        case.assertTrue(
+            torch.equal(pool.w2_scale[slot], w2_scale_inv),
+            f"pool w2 scale row != store bytes (slot {slot})",
+        )
+
+
 def _build(layer_id=0, num_slots=NUM_SLOTS):
     torch.manual_seed(0)
     m = ModelSpec()
@@ -52,6 +83,48 @@ def _build(layer_id=0, num_slots=NUM_SLOTS):
         w13_weight=w13_weight,
         w2_weight=w2_weight,
         num_experts=NUM_EXPERTS,
+    )
+    return rt, cache, stored
+
+
+def _build_fp8(num_slots=NUM_SLOTS):
+    """Like _build but every expert is an fp8 block: e4m3fn payload + a [1, 1]
+    fp32 block scale, wired into a RealWeightPool WITH matching scale params.
+    Pool rows start as NaN canaries so any uncopied row fails torch.equal."""
+    torch.manual_seed(0)
+    m = ModelSpec()
+    m.num_layers = 1
+    m.num_experts = NUM_EXPERTS
+    m.top_k = 1
+    m.shared_experts = 0
+    cache = ExpertCache(m, HardwareSpec(), make_policy("lru", num_slots), SimBackend(1e12))
+
+    store = ExpertHostStore(num_layers=1, num_experts=NUM_EXPERTS)
+    stored = {}
+    for e in range(NUM_EXPERTS):
+        w13 = torch.randn(4, 6).to(torch.float8_e4m3fn)
+        w2 = torch.randn(6, 4).to(torch.float8_e4m3fn)
+        s13 = torch.rand(1, 1, dtype=torch.float32)
+        s2 = torch.rand(1, 1, dtype=torch.float32)
+        store.put(ExpertKey(0, e), w13, w2, w13_scale_inv=s13, w2_scale_inv=s2)
+        # Gate against what the STORE holds, not the pre-put locals.
+        stored[e] = store.get(ExpertKey(0, e))
+
+    fp8 = torch.float8_e4m3fn
+    w13_weight = torch.full((num_slots, 4, 6), float("nan"), dtype=fp8)
+    w2_weight = torch.full((num_slots, 6, 4), float("nan"), dtype=fp8)
+    w13_scale = torch.full((num_slots, 1, 1), float("nan"), dtype=torch.float32)
+    w2_scale = torch.full((num_slots, 1, 1), float("nan"), dtype=torch.float32)
+
+    rt = LayerRuntime(
+        layer_id=0,
+        cache=cache,
+        store=store,
+        w13_weight=w13_weight,
+        w2_weight=w2_weight,
+        num_experts=NUM_EXPERTS,
+        w13_scale_param=w13_scale,
+        w2_scale_param=w2_scale,
     )
     return rt, cache, stored
 
@@ -164,28 +237,67 @@ class TestLayerRuntime(CustomTestCase):
         for e in (2, 3):
             slot = rt.orch.slot_id_of(0, e)
             self.assertGreaterEqual(slot, 0)
-            self.assertTrue(
-                torch.equal(rt.pool.w13[slot], stored[e][0]),
-                f"pool w13 row != store bytes post-eviction (expert {e})",
-            )
-            self.assertTrue(
-                torch.equal(rt.pool.w2[slot], stored[e][1]),
-                f"pool w2 row != store bytes post-eviction (expert {e})",
-            )
+            w13, w2 = stored[e]
+            _gate_pool_rows_match(self, rt.pool, slot, w13, w2)
 
         # Reload after eviction: re-routing expert 0 must land its exact
         # store bytes in a pool row again.
         rt.ensure_resident([0])
         slot0 = rt.orch.slot_id_of(0, 0)
         self.assertGreaterEqual(slot0, 0)
-        self.assertTrue(
-            torch.equal(rt.pool.w13[slot0], stored[0][0]),
-            "reloaded expert 0: pool w13 row != store bytes",
+        w13_0, w2_0 = stored[0]
+        _gate_pool_rows_match(self, rt.pool, slot0, w13_0, w2_0)
+
+
+    def test_fp8_store_roundtrips_payload_and_scales_into_pool(self):
+        # fp8 store entry streamed through ensure_resident into a pool WITH
+        # scale params: weight row AND scale row must equal the store bytes.
+        rt, _cache, stored = _build_fp8()
+
+        rt.ensure_resident([3])
+
+        slot = rt.orch.slot_id_of(0, 3)
+        self.assertGreaterEqual(slot, 0)
+        entry = stored[3]
+        _gate_pool_rows_match(
+            self, rt.pool, slot,
+            entry.w13, entry.w2, entry.w13_scale_inv, entry.w2_scale_inv,
         )
-        self.assertTrue(
-            torch.equal(rt.pool.w2[slot0], stored[0][1]),
-            "reloaded expert 0: pool w2 row != store bytes",
-        )
+
+    def test_copy_in_enforces_scale_contract(self):
+        rt, _cache, stored = _build_fp8()
+        pool = rt.pool
+        entry = stored[3]
+
+        # Mismatched scale SHAPE raises (pool scale params are [1, 1]).
+        with self.assertRaises(AssertionError):
+            pool.copy_in(
+                0, entry.w13, entry.w2,
+                torch.zeros(2, 1, dtype=torch.float32), entry.w2_scale_inv,
+            )
+        # Mismatched scale DTYPE raises.
+        with self.assertRaises(AssertionError):
+            pool.copy_in(
+                0, entry.w13, entry.w2,
+                entry.w13_scale_inv.to(torch.float64),
+                entry.w2_scale_inv.to(torch.float64),
+            )
+        # Pool HAS scale params -> omitting them raises.
+        with self.assertRaises(AssertionError):
+            pool.copy_in(0, entry.w13, entry.w2)
+
+    def test_bf16_scaleless_pool_unchanged_rejects_stray_scales(self):
+        # bf16 store into a scale-less pool: unchanged roundtrip behavior.
+        rt, _cache, stored = _build()
+        rt.ensure_resident([3])
+        slot = rt.orch.slot_id_of(0, 3)
+        w13, w2 = stored[3]
+        _gate_pool_rows_match(self, rt.pool, slot, w13, w2)
+
+        # Scale-less pool -> stray scales in copy_in raise.
+        stray = torch.rand(1, 1, dtype=torch.float32)
+        with self.assertRaises(AssertionError):
+            rt.pool.copy_in(slot, w13, w2, stray, stray)
 
 
 def _build_shared(num_layers):

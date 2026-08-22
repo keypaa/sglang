@@ -20,17 +20,31 @@ from sglang.srt.layers.moe.expert_cache.types import CacheStats, ExpertKey
 
 
 class RealWeightPool:
-    """Adapts FusedMoE weight params to the pool surface copy_in/record_step."""
+    """Adapts FusedMoE weight params to the pool surface copy_in/record_step.
+
+    Optionally owns slot-major fp8 block-scale params; when present, every
+    copy_in must stream matching scale_inv rows alongside the payloads.
+    """
 
     def __init__(
         self,
         w13_weight: torch.Tensor,
         w2_weight: torch.Tensor,
         transfer_stream: Optional["torch.cuda.Stream"] = None,
+        w13_scale: Optional[torch.Tensor] = None,
+        w2_scale: Optional[torch.Tensor] = None,
     ):
         assert w13_weight.dim() == 3 and w2_weight.dim() == 3
+        # Optional fp8 block-scale params ([num_slots, *block_grid]); either
+        # both present or both absent — a half-wired pool would silently
+        # desync payload and scale rows.
+        assert (w13_scale is None) == (w2_scale is None), (
+            "w13_scale and w2_scale must be provided together"
+        )
         self.w13 = w13_weight
         self.w2 = w2_weight
+        self.w13_scale = w13_scale
+        self.w2_scale = w2_scale
         self.num_slots = w13_weight.shape[0]
         self._stream = transfer_stream or (
             torch.cuda.Stream() if torch.cuda.is_available() else None
@@ -45,17 +59,45 @@ class RealWeightPool:
         self._inflight = 0
         self._sync_count = 0
 
-    def copy_in(self, slot_id: int, w13: torch.Tensor, w2: torch.Tensor) -> None:
+    def copy_in(
+        self,
+        slot_id: int,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        w13_scale_inv: Optional[torch.Tensor] = None,
+        w2_scale_inv: Optional[torch.Tensor] = None,
+    ) -> None:
         assert 0 <= slot_id < self.num_slots
         assert self.w13[slot_id].shape == w13.shape and self.w13.dtype == w13.dtype
         assert self.w2[slot_id].shape == w2.shape and self.w2.dtype == w2.dtype
+        copies = [(self.w13, w13), (self.w2, w2)]
+        if self.w13_scale is not None:
+            # Scale-param pool: callers MUST pass matching scales — dropping
+            # them here would leave the slot row's dequant factors stale.
+            assert w13_scale_inv is not None and w2_scale_inv is not None, (
+                "this pool has fp8 scale params; copy_in requires scales"
+            )
+            assert self.w13_scale[slot_id].shape == w13_scale_inv.shape
+            assert self.w13_scale.dtype == w13_scale_inv.dtype
+            assert self.w2_scale[slot_id].shape == w2_scale_inv.shape
+            assert self.w2_scale.dtype == w2_scale_inv.dtype
+            copies += [
+                (self.w13_scale, w13_scale_inv),
+                (self.w2_scale, w2_scale_inv),
+            ]
+        else:
+            # Scale-less pool: stray scales mean a caller wired for another
+            # quant layout; failing loudly beats silently discarding bytes.
+            assert w13_scale_inv is None and w2_scale_inv is None, (
+                "copy_in got scales but this pool has no scale params"
+            )
         if self._stream is not None:
             with torch.cuda.stream(self._stream):
-                self.w13[slot_id].copy_(w13, non_blocking=True)
-                self.w2[slot_id].copy_(w2, non_blocking=True)
+                for dst, src in copies:
+                    dst[slot_id].copy_(src, non_blocking=True)
         else:
-            self.w13[slot_id].copy_(w13)
-            self.w2[slot_id].copy_(w2)
+            for dst, src in copies:
+                dst[slot_id].copy_(src)
         self._pending += 1
         self._inflight += 1
 
@@ -92,12 +134,19 @@ class LayerRuntime:
         w2_weight: torch.Tensor,
         num_experts: int,
         num_layers: int = 1,
+        w13_scale_param: Optional[torch.Tensor] = None,
+        w2_scale_param: Optional[torch.Tensor] = None,
     ):
         assert 0 <= layer_id < num_layers, (
             f"layer_id {layer_id} out of range for num_layers={num_layers}"
         )
         self.layer_id = layer_id
-        self.pool = RealWeightPool(w13_weight, w2_weight)
+        self.pool = RealWeightPool(
+            w13_weight,
+            w2_weight,
+            w13_scale=w13_scale_param,
+            w2_scale=w2_scale_param,
+        )
         self.cache = cache          # shared across layers
         self.store = store
         # The orchestrator is keyed by the REAL model layer id so the shared
@@ -142,7 +191,13 @@ class LayerRuntime:
                     slot = self.orch.slot_id_of(self.layer_id, eid)
                     assert slot >= 0, f"no resident slot for expert {eid}"
                     entry = self.store.get(key)
-                    self.pool.copy_in(slot, entry.w13, entry.w2)
+                    self.pool.copy_in(
+                        slot,
+                        entry.w13,
+                        entry.w2,
+                        entry.w13_scale_inv,
+                        entry.w2_scale_inv,
+                    )
         self.pool.wait_all()
         if copies_pending:
             stall_ms = (time.perf_counter() - t_start) * 1000.0
