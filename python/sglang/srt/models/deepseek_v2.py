@@ -122,7 +122,7 @@ from sglang.srt.layers.moe.utils import (
     is_tbo_enabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.fp8 import Fp8Config, _is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     emit_transposed_bpreshuffle_scale,
     materialize_bpreshuffle_fp8_scale,
@@ -281,6 +281,93 @@ def parse_expert_weight_name(name: str) -> Optional[Tuple[int, str]]:
     if match is None:
         return None
     return int(match.group(1)), _EXPERT_WEIGHT_KIND_BY_SUFFIX[match.group(2)]
+
+
+def _expert_cache_quant_ok(
+    quant_config: Optional[QuantizationConfig],
+    *,
+    flashinfer_trtllm_runner: bool,
+    fnuz_platform: bool,
+    deep_gemm_runner: bool,
+) -> None:
+    """Validate a quant/runner combination for expert-cache init.
+
+    Accepts unquantized (bf16) or plain block-wise fp8 serialized
+    checkpoints; raises ValueError naming what IS supported otherwise.
+    Pure so the accept/reject matrix stays unit-testable on CPU: the caller
+    resolves the runner/platform flags from live state.
+    """
+    # Slot remap reads raw topk_ids, so the TopK backend must emit the
+    # standard format; flashinfer-trtllm bypasses it regardless of quant.
+    if flashinfer_trtllm_runner:
+        raise ValueError(
+            "expert cache requires standard-format TopK output "
+            "(unquantized or block-wise fp8 MoE, non-FlashInfer-TRTLLM "
+            "runner backend)"
+        )
+    if quant_config is None:
+        return
+    if not isinstance(quant_config, Fp8Config):
+        raise ValueError(
+            "expert cache supports unquantized or block-wise fp8 MoE "
+            f"checkpoints (got {type(quant_config).__name__})"
+        )
+    if (
+        quant_config.weight_block_size is None
+        or not quant_config.is_checkpoint_fp8_serialized
+    ):
+        raise ValueError(
+            "expert cache supports only block-wise fp8 checkpoints with "
+            "serialized scales (per-tensor fp8 is unsupported)"
+        )
+    if quant_config.use_mxfp8 or getattr(quant_config, "is_fp4_experts", False):
+        raise ValueError(
+            "expert cache supports only plain block-wise fp8 checkpoints "
+            "(mxfp8/fp4-packed variants are unsupported)"
+        )
+    # fp8-only hazards: fnuz normalization and deep_gemm UE8M0 requant would
+    # transform captured checkpoint bytes; bf16 runs are unaffected by them.
+    if fnuz_platform or deep_gemm_runner:
+        raise ValueError(
+            "fp8 expert cache is unsupported on ROCm/fnuz platforms or with "
+            "--moe-runner-backend=deep_gemm"
+        )
+
+
+def _expert_cache_entry_pairing_ok(
+    layer_id: int, expert_index: int, entry: Dict[str, torch.Tensor]
+) -> None:
+    """Validate one intercepted expert's weight/scale tensor pairing.
+
+    Requires both fused weights present, scales present iff the payload is
+    fp8 (all-or-nothing per side), else raises ValueError. Runs at wiring
+    time after the full weight loop so a half-intercepted checkpoint fails
+    loudly instead of streaming stale dequant factors.
+    """
+    missing = {"w13", "w2"} - set(entry)
+    if missing:
+        raise ValueError(
+            f"layer {layer_id} expert {expert_index}: checkpoint is "
+            f"missing fused expert weights {sorted(missing)}"
+        )
+    for weight_kind in ("w13", "w2"):
+        scale_kind = f"{weight_kind}_scale"
+        weight = entry[weight_kind]
+        weight_is_fp8 = (
+            weight.dtype.is_floating_point and weight.dtype.itemsize == 1
+        )
+        if weight_is_fp8 and scale_kind not in entry:
+            raise ValueError(
+                f"layer {layer_id} expert {expert_index}: fp8 {weight_kind} "
+                f"weight requires its {weight_kind}_weight_scale_inv tensor "
+                "in the checkpoint"
+            )
+        if scale_kind in entry and not weight_is_fp8:
+            raise ValueError(
+                f"layer {layer_id} expert {expert_index}: intercepted "
+                f"{weight_kind}_weight_scale_inv tensor for non-fp8 "
+                f"{weight_kind} weight"
+            )
 
 
 # One-time SGLANG_OPT_MOE_QUANT_ONCE engagement log (see _moe_quant_once_enabled).
@@ -705,17 +792,17 @@ class DeepseekV2MoE(nn.Module):
                     f"--enable-moe-expert-cache requires --moe-a2a-backend=none "
                     f"(got {_a2a!r}); expert-cache MoE has no all-to-all dispatch."
                 )
-            # Slot remap reads raw topk_ids, so the TopK backend must emit the
-            # standard format. This mirrors the output_format condition used
-            # for the TopK construction below; enforce it here so a cache-on
-            # run fails fast instead of at the first forward.
-            if (
-                quant_config is not None
-            ) or get_moe_runner_backend().is_flashinfer_trtllm():
-                raise ValueError(
-                    "expert cache requires standard-format TopK output "
-                    "(unquantized MoE, non-FlashInfer-TRTLLM runner backend)"
-                )
+            # Slot remap reads raw topk_ids, so the TopK backend must emit
+            # the standard format. This mirrors the output_format condition
+            # used for the TopK construction below; enforce it here so a
+            # cache-on run fails fast instead of at the first forward.
+            _runner = get_moe_runner_backend()
+            _expert_cache_quant_ok(
+                quant_config,
+                flashinfer_trtllm_runner=_runner.is_flashinfer_trtllm(),
+                fnuz_platform=_is_fp8_fnuz,
+                deep_gemm_runner=_runner.is_deep_gemm(),
+            )
             num_slots = min(
                 int(getattr(_sa, "moe_cache_slots", 128)), num_experts_for_moe
             )
@@ -787,10 +874,16 @@ class DeepseekV2MoE(nn.Module):
                 fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
                 # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
                 # and requires the output format to be standard (except trtllm). We use quant_config to determine the output format.
+                # Expert-cache layers always request STANDARD: the init guard
+                # already admitted only standard-format-compatible configs
+                # (bf16 / plain block-fp8, non-trtllm), and slot remap needs it.
                 output_format=(
                     TopKOutputFormat.STANDARD
-                    if (quant_config is None)
-                    and (not get_moe_runner_backend().is_flashinfer_trtllm())
+                    if self.expert_cache_enabled
+                    or (
+                        (quant_config is None)
+                        and (not get_moe_runner_backend().is_flashinfer_trtllm())
+                    )
                     else None
                 ),
             )
@@ -3364,6 +3457,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         )
         store = ExpertHostStore(num_layers=num_layers, num_experts=num_experts)
         for moe in self._expert_cache_moe_layers():
+            # Block-fp8 pools carry slot-major scale params alongside the
+            # payloads; bf16 pools have neither (params absent -> None).
+            w13_scale_param = getattr(moe.experts, "w13_weight_scale_inv", None)
+            w2_scale_param = getattr(moe.experts, "w2_weight_scale_inv", None)
             moe.expert_cache_runtime = LayerRuntime(
                 moe.layer_id,
                 cache,
@@ -3372,6 +3469,12 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 moe.experts.w2_weight.data,
                 num_experts=num_experts,
                 num_layers=num_layers,
+                w13_scale_param=(
+                    None if w13_scale_param is None else w13_scale_param.data
+                ),
+                w2_scale_param=(
+                    None if w2_scale_param is None else w2_scale_param.data
+                ),
             )
         self._moe_expert_cache_infra = (cache, store)
 
@@ -3384,12 +3487,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         for (layer_id, expert_index), entry in sorted(
             self._moe_expert_cache_pending.items()
         ):
-            missing = {"w13", "w2"} - set(entry)
-            if missing:
-                raise ValueError(
-                    f"layer {layer_id} expert {expert_index}: checkpoint is "
-                    f"missing fused expert weights {sorted(missing)}"
-                )
+            _expert_cache_entry_pairing_ok(layer_id, expert_index, entry)
             if expert_index >= num_experts:
                 raise ValueError(
                     f"layer {layer_id} expert {expert_index} out of range "
@@ -3398,7 +3496,13 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             # Bulk put AFTER the weight loop so pinning stays off the hot path.
             from sglang.srt.layers.moe.expert_cache import ExpertKey
 
-            store.put(ExpertKey(layer_id, expert_index), entry["w13"], entry["w2"])
+            store.put(
+                ExpertKey(layer_id, expert_index),
+                entry["w13"],
+                entry["w2"],
+                entry.get("w13_scale"),
+                entry.get("w2_scale"),
+            )
         self._moe_expert_cache_pending = {}
         log_info_on_rank0(
             logger,

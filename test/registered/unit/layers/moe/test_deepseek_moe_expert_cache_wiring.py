@@ -16,6 +16,7 @@ from sglang.srt.layers.moe.expert_cache import (
     make_policy,
 )
 from sglang.srt.layers.moe.expert_cache.layer_runtime import LayerRuntime
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -143,6 +144,199 @@ class TestParseExpertWeightName(CustomTestCase):
         )
 
 
+class _DummyQuantConfig(QuantizationConfig):
+    """Minimal non-fp8 quant config for the guard's unsupported-type branch."""
+
+    def get_name(self):
+        return "dummy"
+
+    def get_supported_act_dtypes(self):
+        return [torch.bfloat16]
+
+    @classmethod
+    def get_min_capability(cls):
+        return 0
+
+    @staticmethod
+    def get_config_filenames():
+        return []
+
+    @classmethod
+    def from_config(cls, config):
+        return cls()
+
+    def get_quant_method(self, layer, prefix):
+        return None
+
+    def get_scaled_act_names(self):
+        return []
+
+
+def _fp8_block_config(**kwargs):
+    from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+    return Fp8Config(
+        is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128], **kwargs
+    )
+
+
+def _fp8_per_tensor_config():
+    from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+    # Serialized checkpoint, no weight_block_size -> per-tensor scales.
+    return Fp8Config(is_checkpoint_fp8_serialized=True)
+
+
+class TestExpertCacheQuantGuard(CustomTestCase):
+    """Accept/reject matrix of the pure init guard `_expert_cache_quant_ok`."""
+
+    KW = dict(flashinfer_trtllm_runner=False, fnuz_platform=False, deep_gemm_runner=False)
+
+    def _call(self, quant_config, **overrides):
+        from sglang.srt.models.deepseek_v2 import _expert_cache_quant_ok
+
+        kwargs = dict(self.KW)
+        kwargs.update(overrides)
+        return _expert_cache_quant_ok(quant_config, **kwargs)
+
+    def test_bf16_no_quant_ok(self):
+        self._call(None)
+
+    def test_fp8_block_serialized_ok(self):
+        self._call(_fp8_block_config())
+
+    def test_fp8_per_tensor_raises(self):
+        with self.assertRaises(ValueError) as cm:
+            self._call(_fp8_per_tensor_config())
+        self.assertIn("block-wise", str(cm.exception))
+
+    def test_fp8_not_serialized_raises(self):
+        from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+        with self.assertRaises(ValueError):
+            self._call(Fp8Config())
+
+    def test_mxfp8_variant_raises(self):
+        from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+        mxfp8 = Fp8Config(is_checkpoint_fp8_serialized=True, use_mxfp8=True)
+        with self.assertRaises(ValueError) as cm:
+            self._call(mxfp8)
+        self.assertIn("mxfp8", str(cm.exception))
+
+    def test_fp4_packed_variant_raises(self):
+        fp4 = _fp8_block_config(is_fp4_experts=True)
+        with self.assertRaises(ValueError) as cm:
+            self._call(fp4)
+        self.assertIn("fp4", str(cm.exception))
+
+    def test_non_fp8_quant_raises(self):
+        with self.assertRaises(ValueError) as cm:
+            self._call(_DummyQuantConfig())
+        self.assertIn("DummyQuantConfig", str(cm.exception))
+
+    def test_trtllm_runner_raises_with_and_without_quant(self):
+        for quant in (None, _fp8_block_config()):
+            with self.assertRaises(ValueError) as cm:
+                self._call(quant, flashinfer_trtllm_runner=True)
+            self.assertIn("TRTLLM", str(cm.exception))
+
+    def test_fnuz_platform_raises_for_fp8(self):
+        with self.assertRaises(ValueError) as cm:
+            self._call(_fp8_block_config(), fnuz_platform=True)
+        self.assertIn("fnuz", str(cm.exception))
+
+    def test_deep_gemm_runner_raises_for_fp8(self):
+        with self.assertRaises(ValueError) as cm:
+            self._call(_fp8_block_config(), deep_gemm_runner=True)
+        self.assertIn("deep_gemm", str(cm.exception))
+
+    def test_bf16_fnuz_deep_gemm_still_ok(self):
+        # The fnuz/deepgemm hazards are fp8-specific; bf16 cache runs keep
+        # their pre-M2 acceptance.
+        self._call(None, fnuz_platform=True, deep_gemm_runner=True)
+
+
+def _expert_entry(w13_dtype=torch.bfloat16, w2_dtype=torch.bfloat16, scales=False):
+    entry = {
+        "w13": torch.randn(4, 6).to(w13_dtype),
+        "w2": torch.randn(6, 4).to(w2_dtype),
+    }
+    if scales:
+        entry["w13_scale"] = torch.rand(1, 1, dtype=torch.float32)
+        entry["w2_scale"] = torch.rand(1, 1, dtype=torch.float32)
+    return entry
+
+
+class TestExpertCacheEntryPairing(CustomTestCase):
+    """Weights<->scales presence parity enforced at wiring time."""
+
+    def _validate(self, layer_id=0, expert_index=0, entry=None):
+        from sglang.srt.models.deepseek_v2 import (
+            _expert_cache_entry_pairing_ok,
+        )
+
+        _expert_cache_entry_pairing_ok(layer_id, expert_index, entry)
+
+    def test_bf16_weights_without_scales_ok(self):
+        self._validate(entry=_expert_entry())
+
+    def test_fp8_weights_with_scales_ok(self):
+        fp8 = torch.float8_e4m3fn
+        self._validate(entry=_expert_entry(fp8, fp8, scales=True))
+
+    def test_fp8_weights_without_scales_raises(self):
+        fp8 = torch.float8_e4m3fn
+        with self.assertRaises(ValueError) as cm:
+            self._validate(entry=_expert_entry(fp8, fp8))
+        self.assertIn("scale_inv", str(cm.exception))
+        self.assertIn("expert 0", str(cm.exception))
+
+    def test_stray_scale_without_fp8_weights_raises(self):
+        with self.assertRaises(ValueError) as cm:
+            self._validate(entry=_expert_entry(scales=True))
+        self.assertIn("non-fp8", str(cm.exception))
+
+    def test_half_paired_scales_raises(self):
+        fp8 = torch.float8_e4m3fn
+        entry = _expert_entry(fp8, fp8, scales=True)
+        del entry["w2_scale"]
+        with self.assertRaises(ValueError):
+            self._validate(entry=entry)
+
+    def test_missing_fused_weight_raises(self):
+        entry = _expert_entry()
+        del entry["w2"]
+        with self.assertRaises(ValueError) as cm:
+            self._validate(layer_id=3, expert_index=7, entry=entry)
+        self.assertIn("layer 3 expert 7", str(cm.exception))
+
+
+def _fp8_block_quant_config():
+    from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+    return Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128])
+
+
+def _causal_lm_wiring_shim(moe):
+    """Minimal DeepseekV2ForCausalLM shell exposing the expert-cache wiring
+    methods over one pre-built MoE layer (no full model construction)."""
+    from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+
+    shim = object.__new__(DeepseekV2ForCausalLM)
+    shim.config = SimpleNamespace(
+        num_hidden_layers=1,
+        n_routed_experts=_NUM_EXPERTS,
+        num_experts_per_tok=2,
+        hidden_size=_HIDDEN,
+        moe_intermediate_size=_INTER,
+    )
+    shim.model = SimpleNamespace(
+        start_layer=0, end_layer=1, layers=[SimpleNamespace(mlp=moe)]
+    )
+    return shim
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestWiringSmoke(CustomTestCase):
     @classmethod
@@ -218,6 +412,80 @@ class TestWiringSmoke(CustomTestCase):
             hidden_states = torch.randn(3, _HIDDEN, device="cuda", dtype=torch.bfloat16)
             output = moe_bf16.forward_normal(hidden_states, skip_shared_experts=True)
             self.assertEqual(output.shape, (3, _HIDDEN))
+
+    def test_fp8_block_wiring_threads_scales(self):
+        with _tp1_parallel(), _cache_server_args(), torch.device("cuda"):
+            moe = DeepseekV2MoE(
+                config=_tiny_config(),
+                layer_id=0,
+                quant_config=_fp8_block_quant_config(),
+                prefix="model.layers.0.mlp",
+            )
+            self.assertTrue(moe.expert_cache_enabled)
+
+            # Pool-sized fp8 experts carry slot-major scale_inv params.
+            self.assertEqual(moe.experts.w13_weight.dtype, torch.float8_e4m3fn)
+            w13_scale_param = getattr(moe.experts, "w13_weight_scale_inv", None)
+            w2_scale_param = getattr(moe.experts, "w2_weight_scale_inv", None)
+            self.assertIsNotNone(w13_scale_param)
+            self.assertIsNotNone(w2_scale_param)
+            self.assertEqual(w13_scale_param.dtype, torch.float32)
+
+            # Simulate interception of one expert's fp8 weights + scales
+            # (the interceptor stores raw CPU tensors, as at load time).
+            expert_index = 5
+            w13 = torch.randn(2 * _INTER, _HIDDEN).to(torch.float8_e4m3fn)
+            w2 = torch.randn(_HIDDEN, _INTER).to(torch.float8_e4m3fn)
+            w13_scale_inv = torch.rand(1, 1, dtype=torch.float32)
+            w2_scale_inv = torch.rand(1, 1, dtype=torch.float32)
+            moe._moe_expert_cache_pending = {
+                (0, expert_index): {
+                    "w13": w13,
+                    "w2": w2,
+                    "w13_scale": w13_scale_inv,
+                    "w2_scale": w2_scale_inv,
+                }
+            }
+
+            shim = _causal_lm_wiring_shim(moe)
+            shim._build_expert_cache_infra()
+            pool = moe.expert_cache_runtime.pool
+            # LayerRuntime was threaded the fp8 scale params.
+            self.assertIsNotNone(pool.w13_scale)
+            self.assertIsNotNone(pool.w2_scale)
+            self.assertEqual(
+                pool.w13_scale.data_ptr(), w13_scale_param.data_ptr()
+            )
+            self.assertEqual(
+                pool.w2_scale.data_ptr(), w2_scale_param.data_ptr()
+            )
+
+            shim._finish_expert_cache_wiring()
+            entry = moe.expert_cache_runtime.store.get(ExpertKey(0, expert_index))
+            self.assertTrue(torch.equal(entry.w13, w13))
+            self.assertTrue(torch.equal(entry.w2, w2))
+            self.assertTrue(torch.equal(entry.w13_scale_inv, w13_scale_inv))
+            self.assertTrue(torch.equal(entry.w2_scale_inv, w2_scale_inv))
+
+    def test_fp8_entry_without_scales_raises_at_wiring(self):
+        with _tp1_parallel(), _cache_server_args(), torch.device("cuda"):
+            moe = DeepseekV2MoE(
+                config=_tiny_config(),
+                layer_id=0,
+                quant_config=_fp8_block_quant_config(),
+                prefix="model.layers.0.mlp",
+            )
+            moe._moe_expert_cache_pending = {
+                (0, 1): {
+                    "w13": torch.randn(2 * _INTER, _HIDDEN).to(torch.float8_e4m3fn),
+                    "w2": torch.randn(_HIDDEN, _INTER).to(torch.float8_e4m3fn),
+                }
+            }
+            shim = _causal_lm_wiring_shim(moe)
+            shim._build_expert_cache_infra()
+            with self.assertRaises(ValueError) as cm:
+                shim._finish_expert_cache_wiring()
+            self.assertIn("weight_scale_inv", str(cm.exception))
 
 
 if __name__ == "__main__":
