@@ -289,6 +289,7 @@ def _expert_cache_quant_ok(
     flashinfer_trtllm_runner: bool,
     fnuz_platform: bool,
     deep_gemm_runner: bool,
+    aiter_platform: bool = False,
 ) -> None:
     """Validate a quant/runner combination for expert-cache init.
 
@@ -296,14 +297,19 @@ def _expert_cache_quant_ok(
     checkpoints; raises ValueError naming what IS supported otherwise.
     Pure so the accept/reject matrix stays unit-testable on CPU: the caller
     resolves the runner/platform flags from live state.
+
+    Runner policy is an ALLOWLIST (auto/triton only): every other backend
+    (flashinfer-trtllm, flashinfer_trtllm_routed, deep_gemm) either bypasses
+    the standard TopK format or applies post-load byte transforms the store's
+    captured bytes cannot survive. New backends are rejected by default.
     """
     # Slot remap reads raw topk_ids, so the TopK backend must emit the
-    # standard format; flashinfer-trtllm bypasses it regardless of quant.
+    # standard format; non-triton runner backends bypass it or transform
+    # bytes regardless of quant.
     if flashinfer_trtllm_runner:
         raise ValueError(
-            "expert cache requires standard-format TopK output "
-            "(unquantized or block-wise fp8 MoE, non-FlashInfer-TRTLLM "
-            "runner backend)"
+            "expert cache requires the auto/triton MoE runner backend "
+            "(standard-format TopK output, no post-load byte transforms)"
         )
     if quant_config is None:
         return
@@ -325,12 +331,18 @@ def _expert_cache_quant_ok(
             "expert cache supports only plain block-wise fp8 checkpoints "
             "(mxfp8/fp4-packed variants are unsupported)"
         )
-    # fp8-only hazards: fnuz normalization and deep_gemm UE8M0 requant would
-    # transform captured checkpoint bytes; bf16 runs are unaffected by them.
+    # fp8-only hazards: fnuz normalization, aiter pre-shuffle, and deep_gemm
+    # UE8M0 requant would transform captured checkpoint bytes; bf16 runs are
+    # unaffected by them.
     if fnuz_platform or deep_gemm_runner:
         raise ValueError(
             "fp8 expert cache is unsupported on ROCm/fnuz platforms or with "
             "--moe-runner-backend=deep_gemm"
+        )
+    if quant_config is not None and aiter_platform:
+        raise ValueError(
+            "fp8 expert cache is unsupported on aiter/ROCm shuffle paths "
+            "(checkpoint bytes would be shuffled after capture)"
         )
 
 
@@ -797,11 +809,19 @@ class DeepseekV2MoE(nn.Module):
             # used for the TopK construction below; enforce it here so a
             # cache-on run fails fast instead of at the first forward.
             _runner = get_moe_runner_backend()
+            # Allowlist: auto resolves to triton here (a2a=none, no deepgemm),
+            # and triton is the only runner whose fp8 block path leaves
+            # checkpoint bytes untouched. Everything else — flashinfer-trtllm,
+            # flashinfer_trtllm_routed, deep_gemm — either bypasses standard
+            # TopK or transforms bytes post-load.
             _expert_cache_quant_ok(
                 quant_config,
-                flashinfer_trtllm_runner=_runner.is_flashinfer_trtllm(),
+                flashinfer_trtllm_runner=not (
+                    _runner.is_auto() or _runner.is_triton()
+                ),
                 fnuz_platform=_is_fp8_fnuz,
                 deep_gemm_runner=_runner.is_deep_gemm(),
+                aiter_platform=_use_aiter,
             )
             num_slots = min(
                 int(getattr(_sa, "moe_cache_slots", 128)), num_experts_for_moe

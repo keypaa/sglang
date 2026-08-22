@@ -239,7 +239,15 @@ class TestExpertCacheQuantGuard(CustomTestCase):
         for quant in (None, _fp8_block_config()):
             with self.assertRaises(ValueError) as cm:
                 self._call(quant, flashinfer_trtllm_runner=True)
-            self.assertIn("TRTLLM", str(cm.exception))
+            self.assertIn("auto/triton", str(cm.exception))
+
+    def test_aiter_platform_raises_for_fp8_only(self):
+        # aiter pre-shuffles pool bytes post-load: fatal for fp8 streaming,
+        # irrelevant to bf16 runs (no captured bytes to transform).
+        with self.assertRaises(ValueError) as cm:
+            self._call(_fp8_block_config(), aiter_platform=True)
+        self.assertIn("aiter", str(cm.exception))
+        self._call(None, aiter_platform=True)
 
     def test_fnuz_platform_raises_for_fp8(self):
         with self.assertRaises(ValueError) as cm:

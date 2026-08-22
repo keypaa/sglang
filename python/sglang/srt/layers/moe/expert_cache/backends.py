@@ -162,11 +162,12 @@ class CudaTransferBackend(TransferBackend):
             w13, w2 = src
             w13_scale = w2_scale = None
         if w13_scale is not None or w2_scale is not None:
-            # Scale blocks only make sense for pools that accept them
-            # (RealWeightPool); the Phase-2 StaticExpertPool has none.
+            # The CUDA transfer backend targets StaticExpertPool, whose slots
+            # are payload-only; scale-carrying sources must use the
+            # RealWeightPool path (LayerRuntime manual copies).
             raise NotImplementedError(
-                "expert source carries scale blocks but this pool does not "
-                "accept them"
+                "CudaTransferBackend does not support scale blocks; use the "
+                "RealWeightPool streaming path for fp8 experts"
             )
         # slot.node.index == pool slot id (0..capacity-1); no new field.
         self._pool.copy_in(slot.node.index, w13, w2)
