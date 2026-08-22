@@ -45,7 +45,7 @@ def _tiny_config(hidden: int = _HIDDEN, inter: int = _INTER) -> SimpleNamespace:
     return SimpleNamespace(
         hidden_size=hidden,
         intermediate_size=inter,
-        moe_intermediate_size=_INTER,
+        moe_intermediate_size=inter,
         n_routed_experts=_NUM_EXPERTS,
         num_experts_per_tok=2,
         n_shared_experts=None,
