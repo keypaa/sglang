@@ -29,6 +29,12 @@ class TestMoeExpertCacheGuards(CustomTestCase):
         with pytest.raises(ValueError, match="tp-size"):
             validate_moe_expert_cache(_args(disable_cuda_graph=True, tp_size=2))
 
+    def test_rejects_speculative_decoding(self):
+        with pytest.raises(ValueError, match="speculative"):
+            validate_moe_expert_cache(
+                _args(disable_cuda_graph=True, speculative_algorithm="EAGLE")
+            )
+
     def test_slots_clamped_to_routed_experts(self):
         slots = validate_moe_expert_cache(
             _args(disable_cuda_graph=True, moe_cache_slots=999)

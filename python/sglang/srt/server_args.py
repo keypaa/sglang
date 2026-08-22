@@ -9926,6 +9926,11 @@ def validate_moe_expert_cache(args) -> int:
             "--enable-moe-expert-cache currently requires tp-size=1 and "
             "ep-size=1."
         )
+    if getattr(args, "speculative_algorithm", None) is not None:
+        raise ValueError(
+            "--enable-moe-expert-cache does not yet support speculative "
+            "decoding (NextN/MTP draft MoE layers are unwired)."
+        )
     if args.moe_cache_slots < 1:
         raise ValueError("--moe-cache-slots must be >= 1.")
     # Clamp against the largest plausible routed-expert count; the model layer
