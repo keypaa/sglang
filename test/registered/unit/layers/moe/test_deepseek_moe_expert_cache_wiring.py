@@ -40,11 +40,11 @@ def _free_master_port() -> str:
     return port
 
 
-def _tiny_config() -> SimpleNamespace:
+def _tiny_config(hidden: int = _HIDDEN, inter: int = _INTER) -> SimpleNamespace:
     # Minimal DeepseekV2Config-like namespace for DeepseekV2MoE.__init__.
     return SimpleNamespace(
-        hidden_size=_HIDDEN,
-        intermediate_size=_INTER,
+        hidden_size=hidden,
+        intermediate_size=inter,
         moe_intermediate_size=_INTER,
         n_routed_experts=_NUM_EXPERTS,
         num_experts_per_tok=2,
