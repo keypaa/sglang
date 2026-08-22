@@ -84,11 +84,14 @@ class StaticExpertPool:
     def wait_all(self) -> None:
         """Block the host until all in-flight copies complete (tests/shutdown).
 
-        Only the transfer stream needs syncing: every pool write goes through
-        it, so once it is drained no later device work anywhere can race a
-        pool read. The previous extra torch.cuda.synchronize() doubled the
-        host stall for nothing (measured: dominates all-hit step latency).
+        Fast path: no copies enqueued since the last record_step -> nothing to
+        wait for; an unconditional stream synchronize here cost ~ms per
+        all-hit step (measured). Only the transfer stream needs syncing: every
+        pool write goes through it, so once it is drained no later device work
+        anywhere can race a pool read.
         """
+        if self._pending_copies == 0:
+            return
         self._stream.synchronize()
 
     def step_event(self) -> torch.cuda.Event:
