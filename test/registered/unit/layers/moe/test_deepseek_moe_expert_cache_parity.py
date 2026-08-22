@@ -357,12 +357,25 @@ def _build_fp8_model(cache_enabled: bool) -> DeepseekV2ForCausalLM:
 
 
 def _canonical_non_expert_items(a_state_dict):
-    """Deterministic bf16 tensors for every non-expert param name."""
+    """Deterministic tensors for every non-expert param name.
+
+    With Fp8Config every Linear is quantized, so non-expert params include
+    fp8 payloads (no randn kernel) and fp32 scale blocks (must stay
+    positive: negative scales would push both models' logits into NaN
+    territory and break allclose).
+    """
     items = []
     for name, t in sorted(a_state_dict.items()):
         if ".mlp.experts." in name:
             continue
-        items.append((name, torch.randn(t.shape, dtype=t.dtype)))
+        flat = torch.arange(t.numel(), dtype=torch.float32)
+        if t.dtype == torch.float8_e4m3fn:
+            vals = ((flat % 60) + 20) * 0.25  # [5, 20) — safe e4m3 magnitudes
+        elif "weight_scale" in name:
+            vals = ((flat % 40) + 10) * 0.125  # strictly positive scales
+        else:
+            vals = torch.randn(t.numel(), dtype=torch.float32) * 0.05
+        items.append((name, vals.reshape(t.shape).to(t.dtype)))
     return items
 
 

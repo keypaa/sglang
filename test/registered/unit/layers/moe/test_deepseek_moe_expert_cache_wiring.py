@@ -318,6 +318,12 @@ def _fp8_block_quant_config():
     return Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128])
 
 
+def _fp8_tiny_config():
+    """fp8 needs expert dims divisible by the 128x128 quant blocks:
+    w13 N=2*inter and K=hidden, w2 N=hidden and K=inter."""
+    return _tiny_config(hidden=256, inter=128)
+
+
 def _causal_lm_wiring_shim(moe):
     """Minimal DeepseekV2ForCausalLM shell exposing the expert-cache wiring
     methods over one pre-built MoE layer (no full model construction)."""
@@ -416,7 +422,7 @@ class TestWiringSmoke(CustomTestCase):
     def test_fp8_block_wiring_threads_scales(self):
         with _tp1_parallel(), _cache_server_args(), torch.device("cuda"):
             moe = DeepseekV2MoE(
-                config=_tiny_config(),
+                config=_fp8_tiny_config(),
                 layer_id=0,
                 quant_config=_fp8_block_quant_config(),
                 prefix="model.layers.0.mlp",
@@ -434,10 +440,11 @@ class TestWiringSmoke(CustomTestCase):
             # Simulate interception of one expert's fp8 weights + scales
             # (the interceptor stores raw CPU tensors, as at load time).
             expert_index = 5
-            w13 = torch.randn(2 * _INTER, _HIDDEN).to(torch.float8_e4m3fn)
-            w2 = torch.randn(_HIDDEN, _INTER).to(torch.float8_e4m3fn)
-            w13_scale_inv = torch.rand(1, 1, dtype=torch.float32)
-            w2_scale_inv = torch.rand(1, 1, dtype=torch.float32)
+            inter, hidden = 128, 256  # matches _fp8_tiny_config()
+            w13 = torch.randn(2 * inter, hidden).to(torch.float8_e4m3fn)
+            w2 = torch.randn(hidden, inter).to(torch.float8_e4m3fn)
+            w13_scale_inv = torch.rand(2 * inter // 128, hidden // 128)
+            w2_scale_inv = torch.rand(hidden // 128, inter // 128)
             moe._moe_expert_cache_pending = {
                 (0, expert_index): {
                     "w13": w13,
@@ -470,15 +477,15 @@ class TestWiringSmoke(CustomTestCase):
     def test_fp8_entry_without_scales_raises_at_wiring(self):
         with _tp1_parallel(), _cache_server_args(), torch.device("cuda"):
             moe = DeepseekV2MoE(
-                config=_tiny_config(),
+                config=_fp8_tiny_config(),
                 layer_id=0,
                 quant_config=_fp8_block_quant_config(),
                 prefix="model.layers.0.mlp",
             )
             moe._moe_expert_cache_pending = {
                 (0, 1): {
-                    "w13": torch.randn(2 * _INTER, _HIDDEN).to(torch.float8_e4m3fn),
-                    "w2": torch.randn(_HIDDEN, _INTER).to(torch.float8_e4m3fn),
+                    "w13": torch.randn(256, 256).to(torch.float8_e4m3fn),
+                    "w2": torch.randn(256, 128).to(torch.float8_e4m3fn),
                 }
             }
             shim = _causal_lm_wiring_shim(moe)
