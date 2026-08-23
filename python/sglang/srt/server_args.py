@@ -9915,11 +9915,13 @@ def validate_moe_expert_cache(args) -> int:
         args = SimpleNamespace(**args)
     if not args.enable_moe_expert_cache:
         return 0
-    if not getattr(args, "disable_cuda_graph", False):
+    if not getattr(args, "disable_cuda_graph", False) and getattr(
+        args, "cuda_graph_backend_decode", None
+    ) != "tc_piecewise":
         raise ValueError(
-            "--enable-moe-expert-cache milestone 1 requires "
-            "--disable-cuda-graph (the router runs inside the captured decode "
-            "graph; eager-only until that design lands)."
+            "--enable-moe-expert-cache requires either --disable-cuda-graph "
+            "(eager) or --cuda-graph-backend-decode tc_piecewise (segmented "
+            "decode graphs)."
         )
     if getattr(args, "tp_size", 1) > 1 or getattr(args, "ep_size", 1) > 1:
         raise ValueError(

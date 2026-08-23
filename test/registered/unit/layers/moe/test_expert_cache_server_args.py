@@ -25,6 +25,41 @@ class TestMoeExpertCacheGuards(CustomTestCase):
         with pytest.raises(ValueError, match="disable-cuda-graph"):
             validate_moe_expert_cache(_args())
 
+    def test_accepts_tc_piecewise_decode(self):
+        assert (
+            validate_moe_expert_cache(
+                _args(cuda_graph_backend_decode="tc_piecewise")
+            )
+            == 128
+        )
+
+    def test_accepts_tc_piecewise_with_disable_cuda_graph(self):
+        assert (
+            validate_moe_expert_cache(
+                _args(
+                    disable_cuda_graph=True,
+                    cuda_graph_backend_decode="tc_piecewise",
+                )
+            )
+            == 128
+        )
+
+    def test_rejects_full_backend(self):
+        with pytest.raises(ValueError, match="tc_piecewise"):
+            validate_moe_expert_cache(_args(cuda_graph_backend_decode="full"))
+
+    def test_rejects_breakable_backend(self):
+        with pytest.raises(ValueError, match="tc_piecewise"):
+            validate_moe_expert_cache(
+                _args(cuda_graph_backend_decode="breakable")
+            )
+
+    def test_rejects_disabled_backend(self):
+        with pytest.raises(ValueError, match="disable-cuda-graph"):
+            validate_moe_expert_cache(
+                _args(cuda_graph_backend_decode="disabled")
+            )
+
     def test_rejects_tp(self):
         with pytest.raises(ValueError, match="tp-size"):
             validate_moe_expert_cache(_args(disable_cuda_graph=True, tp_size=2))
