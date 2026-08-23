@@ -19,8 +19,8 @@ Backend selection comes from cuda_graph_config.decode:
                       torch.cuda.CUDAGraph per shape.
   - "breakable" — experimental, BreakableCudaGraphBackend:
                       segmented capture (no torch.compile).
-  - "tc_piecewise"     — not implemented for decode; logs a one-shot warning
-                      and falls back to "full".
+  - "tc_piecewise"     — experimental, TcPiecewiseCudaGraphBackend:
+                      torch.compile-driven segmented capture.
 """
 
 from __future__ import annotations

@@ -1678,6 +1678,7 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
                 )
             ),
             enable_torch_compile_debug_mode=False,
+            enable_moe_expert_cache=False,
         )
 
         config = TcPiecewiseCudaGraphBackend.build_compilation_config(server_args)

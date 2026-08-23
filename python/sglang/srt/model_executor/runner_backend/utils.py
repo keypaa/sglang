@@ -45,9 +45,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Track first occurrence of each fallback warning to avoid log spam.
-_TC_PIECEWISE_DECODE_FALLBACK_LOGGED = False
-
 
 def resolve_decode_backend(
     cuda_graph_runner: BaseCudaGraphRunner,
@@ -89,13 +86,7 @@ def resolve_decode_backend(
             debug_eager=model_runner.server_args.debug_cuda_graph,
         )
     if backend_name == Backend.TC_PIECEWISE:
-        global _TC_PIECEWISE_DECODE_FALLBACK_LOGGED
-        if not _TC_PIECEWISE_DECODE_FALLBACK_LOGGED:
-            logger.warning(
-                "cuda_graph_config decode='tc_piecewise' is not yet implemented; "
-                "falling back to 'full'."
-            )
-            _TC_PIECEWISE_DECODE_FALLBACK_LOGGED = True
+        return TcPiecewiseCudaGraphBackend(cuda_graph_runner)
     return FullCudaGraphBackend(
         cuda_graph_runner, enable_memory_saver=enable_memory_saver
     )

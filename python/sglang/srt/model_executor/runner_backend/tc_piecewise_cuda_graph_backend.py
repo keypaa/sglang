@@ -108,8 +108,9 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
 
     @staticmethod
     def build_compilation_config(server_args: ServerArgs) -> CompilationConfig:
-        """Construct a CompilationConfig from ServerArgs and
-        register the MoE A2A split-op when DeepEP / Mooncake is in use."""
+        """Construct a CompilationConfig from ServerArgs and register the
+        MoE split-op when DeepEP / Mooncake is in use or the expert cache
+        needs a per-replay eager MoE gap."""
         prefill = server_args.cuda_graph_config.prefill
         num_tokens = prefill.bs
         compiler = prefill.tc_compiler
@@ -125,7 +126,12 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
             server_args.enable_torch_compile_debug_mode,
         )
 
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        a2a_backend = get_moe_a2a_backend()
+        if (
+            a2a_backend.is_deepep()
+            or a2a_backend.is_mooncake()
+            or server_args.enable_moe_expert_cache
+        ):
             config.add_split_op("sglang.moe_forward_piecewise_cuda_graph_impl")
 
         return config
