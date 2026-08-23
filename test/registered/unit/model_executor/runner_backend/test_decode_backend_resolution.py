@@ -47,10 +47,12 @@ def _make_runner(decode_backend):
     )
 
 
-def _make_server_args(enable_moe_expert_cache):
+def _make_server_args(
+    enable_moe_expert_cache, decode_backend=Backend.TC_PIECEWISE
+):
     return SimpleNamespace(
         cuda_graph_config=CudaGraphConfig(
-            decode=PhaseConfig(backend=Backend.TC_PIECEWISE),
+            decode=PhaseConfig(backend=decode_backend),
             prefill=PhaseConfig(
                 backend=Backend.TC_PIECEWISE, bs=[32, 64], tc_compiler="eager"
             ),
@@ -60,7 +62,14 @@ def _make_server_args(enable_moe_expert_cache):
     )
 
 
-def _build_config(mock_a2a, *, deepep=False, mooncake=False, expert_cache=False):
+def _build_config(
+    mock_a2a,
+    *,
+    deepep=False,
+    mooncake=False,
+    expert_cache=False,
+    decode_backend=Backend.TC_PIECEWISE,
+):
     mock_a2a.return_value = SimpleNamespace(
         is_deepep=lambda: deepep, is_mooncake=lambda: mooncake
     )
@@ -69,7 +78,7 @@ def _build_config(mock_a2a, *, deepep=False, mooncake=False, expert_cache=False)
     )
 
     return tc_backend_mod.TcPiecewiseCudaGraphBackend.build_compilation_config(
-        _make_server_args(expert_cache)
+        _make_server_args(expert_cache, decode_backend)
     )
 
 
@@ -111,16 +120,10 @@ class TestBuildCompilationConfigMoeSplitOp(CustomTestCase):
         "tc_piecewise_cuda_graph_backend.get_moe_a2a_backend"
     )
     def test_expert_cache_enables_split_op(self, mock_a2a):
-        config = _build_config(mock_a2a, expert_cache=True)
+        config = _build_config(
+            mock_a2a, expert_cache=True, decode_backend=Backend.FULL
+        )
         self.assertIn(_MOE_SPLIT_OP, config.split_ops)
-
-    @patch(
-        "sglang.srt.model_executor.runner_backend."
-        "tc_piecewise_cuda_graph_backend.get_moe_a2a_backend"
-    )
-    def test_plain_config_keeps_moe_baked(self, mock_a2a):
-        config = _build_config(mock_a2a, expert_cache=False)
-        self.assertNotIn(_MOE_SPLIT_OP, config.split_ops)
 
     @patch(
         "sglang.srt.model_executor.runner_backend."
@@ -145,6 +148,26 @@ class TestBuildCompilationConfigMoeSplitOp(CustomTestCase):
     def test_no_duplicate_registration_when_both_true(self, mock_a2a):
         config = _build_config(mock_a2a, deepep=True, expert_cache=True)
         self.assertEqual(config.split_ops.count(_MOE_SPLIT_OP), 1)
+
+    @patch(
+        "sglang.srt.model_executor.runner_backend."
+        "tc_piecewise_cuda_graph_backend.get_moe_a2a_backend"
+    )
+    def test_tc_piecewise_decode_opt_in_enables_split_op(self, mock_a2a):
+        config = _build_config(mock_a2a, expert_cache=False)
+        self.assertIn(_MOE_SPLIT_OP, config.split_ops)
+
+    @patch(
+        "sglang.srt.model_executor.runner_backend."
+        "tc_piecewise_cuda_graph_backend.get_moe_a2a_backend"
+    )
+    def test_prefill_only_piecewise_config_stays_unregistered(self, mock_a2a):
+        config = _build_config(
+            mock_a2a,
+            expert_cache=False,
+            decode_backend=Backend.FULL,
+        )
+        self.assertNotIn(_MOE_SPLIT_OP, config.split_ops)
 
 
 if __name__ == "__main__":
