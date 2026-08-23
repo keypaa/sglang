@@ -15,6 +15,11 @@ from .expert_cache import ExpertCache, Slot
 from .freq_sketch import FreqSketch
 from .host_store import ExpertHostStore, HostStoreEntry
 from .orchestrator import StaticPoolOrchestrator
+from .piecewise_hook import (
+    expert_cache_prepare,
+    register_expert_cache_runtime,
+    unregister_expert_cache_runtime,
+)
 from .policies import (
     EvictionPolicy,
     KeyNode,
@@ -59,7 +64,10 @@ __all__ = [
     "TinyLFUPolicy",
     "TraceGenerator",
     "TransferBackend",
+    "expert_cache_prepare",
     "make_policy",
+    "register_expert_cache_runtime",
     "remap_topk_ids",
     "run_simulation",
+    "unregister_expert_cache_runtime",
 ]
