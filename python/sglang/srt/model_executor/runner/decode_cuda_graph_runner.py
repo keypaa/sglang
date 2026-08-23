@@ -82,9 +82,15 @@ from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend import (
+    TcPiecewiseCudaGraphBackend,
+)
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    set_tc_piecewise_forward_context,
 )
 from sglang.srt.model_executor.runner_utils.buffers import (
     DecodeInputBuffers,
@@ -453,6 +459,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         # --- backend ---------------------------------------------------
+        self._replay_fb_view: Optional[ForwardBatch] = None
         self.backend = resolve_decode_backend(self)
 
         # --- capture --------------------------------------------------
@@ -462,6 +469,48 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         except RuntimeError as e:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n" f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+            )
+
+    def _uses_tc_piecewise(self) -> bool:
+        return isinstance(self.backend, TcPiecewiseCudaGraphBackend)
+
+    def _tc_piecewise_context(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        num_tokens: int,
+        raw_num_tokens: Optional[int] = None,
+    ):
+        model_runner = self.model_runner
+        return set_tc_piecewise_forward_context(
+            forward_batch,
+            getattr(model_runner, "attention_layers", None),
+            getattr(model_runner.model, "quant_config", None),
+            getattr(model_runner, "moe_layers", None),
+            getattr(model_runner, "moe_fusions", None),
+            dsa_indexers=getattr(model_runner, "dsa_indexers", None),
+            mha_companion_layers=getattr(model_runner, "mha_companion_layers", None),
+            num_tokens=num_tokens,
+            raw_num_tokens=raw_num_tokens,
+        )
+
+    def _run_dummy_forward(self, num_tokens: int) -> None:
+        """Compile-pass hook consumed by TcPiecewiseCudaGraphBackend.__init__:
+        build a dummy decode batch at this token count and run one forward
+        inside the tc_piecewise forward context (no CUDA graph capture)."""
+        bs = max(num_tokens // self.captured_req_width, 1)
+        forward_batch, attn_backend, _ = self.capture_prepare(bs)
+        attn_backend.init_forward_metadata(forward_batch)
+        tc_ctx = (
+            self._tc_piecewise_context(forward_batch, num_tokens=num_tokens)
+            if self._uses_tc_piecewise()
+            else empty_context()
+        )
+        with forward_context(ForwardContext(attn_backend=attn_backend)), tc_ctx:
+            self.model_runner.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
             )
 
     def _record_in_graph_metadata_prep_done(self):
@@ -1139,7 +1188,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
         # that wraps the warmup/capture forward.
-        with forward_context(ForwardContext(attn_backend=attn_backend)):
+        tc_ctx = (
+            self._tc_piecewise_context(forward_batch, num_tokens=num_tokens)
+            if self._uses_tc_piecewise()
+            else empty_context()
+        )
+        with forward_context(
+            ForwardContext(attn_backend=attn_backend)
+        ), tc_ctx:
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
             if forward_batch.lora_ids is not None:
@@ -1361,6 +1417,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             is_encoder_decoder=self.is_encoder_decoder,
         )
         attn_backend.init_forward_metadata_out_graph(fb_view)
+        self._replay_fb_view = fb_view
 
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
@@ -1413,7 +1470,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
-            output = self.backend.replay(self._replay_graph_key, forward_batch)
+            tc_ctx = (
+                self._tc_piecewise_context(
+                    self._replay_fb_view,
+                    num_tokens=self.bs * self.captured_req_width,
+                    raw_num_tokens=self.raw_num_token,
+                )
+                if self._uses_tc_piecewise()
+                else empty_context()
+            )
+            with tc_ctx:
+                output = self.backend.replay(self._replay_graph_key, forward_batch)
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)

@@ -154,6 +154,17 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
             graph_pool=graph_pool,
         )
 
+    @staticmethod
+    def _compile_capture_sizes(cuda_graph_runner: BaseCudaGraphRunner) -> list:
+        """Per-shape token counts for the compile pass. Prefill runners
+        publish capture_num_tokens directly; decode runners key graphs by
+        bs and derive the token axis as bs * captured_req_width."""
+        sizes = cuda_graph_runner.capture_num_tokens
+        if sizes is None:
+            width = cuda_graph_runner.captured_req_width
+            sizes = [bs * width for bs in cuda_graph_runner.capture_bs]
+        return sizes
+
     def _run_compile_pass(self, cuda_graph_runner: BaseCudaGraphRunner) -> None:
         """JIT-activate kernels at the smallest shape, install
         torch.compile, then run one forward per shape inside
@@ -166,13 +177,14 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         # itself when `.model` is absent.
         inner_model = getattr(language_model, "model", language_model)
         compiler = self._compile_config.compiler
+        capture_sizes = self._compile_capture_sizes(cuda_graph_runner)
         with enable_tc_piecewise_cuda_graph():
             try:
                 if compiler != "eager":
                     _toggle_fused_ops(inner_model, reverse=False, num_tokens=16)
 
                 cuda_graph_runner._run_dummy_forward(
-                    num_tokens=cuda_graph_runner.capture_num_tokens[0]
+                    num_tokens=capture_sizes[0]
                 )
 
                 if self._pool is None:
@@ -194,15 +206,13 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                         # CUDA graph recording.  The N-iteration loop is
                         # redundant and extremely slow on ROCm (~30 min).
                         cuda_graph_runner._run_dummy_forward(
-                            num_tokens=cuda_graph_runner.capture_num_tokens[-1]
+                            num_tokens=capture_sizes[-1]
                         )
                     else:
                         compile_range = (
-                            tqdm.tqdm(
-                                list(reversed(cuda_graph_runner.capture_num_tokens))
-                            )
+                            tqdm.tqdm(list(reversed(capture_sizes)))
                             if get_parallel().tp_rank == 0
-                            else reversed(cuda_graph_runner.capture_num_tokens)
+                            else reversed(capture_sizes)
                         )
                         for num_tokens in compile_range:
                             if get_parallel().tp_rank == 0:
@@ -215,9 +225,11 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                 # visual encoding. First trace the tensor branch above, then
                 # execute it once outside the compile-warmup marker so its
                 # regular kernel/JIT warmup also happens during startup.
-                cuda_graph_runner.run_dummy_multimodal_deepstack_forward(
-                    inner_model, cuda_graph_runner.capture_num_tokens[-1]
+                run_deepstack_warmup = getattr(
+                    cuda_graph_runner, "run_dummy_multimodal_deepstack_forward", None
                 )
+                if run_deepstack_warmup is not None:
+                    run_deepstack_warmup(inner_model, capture_sizes[-1])
             finally:
                 _toggle_fused_ops(inner_model, reverse=True, num_tokens=16)
 
