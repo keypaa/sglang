@@ -148,6 +148,10 @@ every decode-step replay:
 
 No weight bytes move inside any captured graph, and the residency fence stays
 outside capture — a captured graph still cannot wait on the transfer stream.
+Because both phases share one compilation config, opting decode into
+`tc_piecewise` also splits prefill's compiled graphs at MoE whenever prefill
+compiles piecewise — structurally necessary so the prepare hook runs in every
+piecewise phase — so the same small per-layer eager-gap cost applies to prefill.
 Cross-layer/token prefetch pipelining remains out of scope: demand misses are
 served only at segment gaps.
 
