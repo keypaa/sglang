@@ -1853,6 +1853,74 @@ class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):
         )
 
 
+class TestMoeExpertCacheGraphReconciliation(CustomTestCase):
+    """The expert-cache guard must judge the *effective* phase backends:
+    explicit --cuda-graph-config JSON outranks --cuda-graph-backend-*
+    flags in the merge, so a pre-merge flag-only check is bypassable."""
+
+    def _handle(self, **overrides):
+        args = ServerArgs(model_path="dummy", **overrides)
+        args.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            is_piecewise_cuda_graph_disabled_model=False,
+            is_multimodal=False,
+            is_multimodal_piecewise_cuda_graph_supported=False,
+        )
+        with (
+            patch("sglang.srt.utils.is_cuda", return_value=True),
+            patch.object(ServerArgs, "use_mla_backend", return_value=False),
+        ):
+            args._handle_cuda_graph_config()
+        return args
+
+    def test_json_full_decode_rejected_despite_tc_piecewise_flag(self):
+        with self.assertRaisesRegex(
+            ValueError, "cuda_graph_config\\[decode\\].backend resolved to 'full'"
+        ):
+            self._handle(
+                enable_moe_expert_cache=True,
+                cuda_graph_backend_decode="tc_piecewise",
+                cuda_graph_config={"decode": {"backend": "full"}},
+            )
+
+    def test_disable_flag_with_json_full_decode_rejected(self):
+        # The legacy disable flag sets decode=disabled at lowest precedence;
+        # the JSON override wins the merge and must still be rejected.
+        with self.assertRaisesRegex(
+            ValueError, "cuda_graph_config\\[decode\\].backend resolved to 'full'"
+        ):
+            self._handle(
+                enable_moe_expert_cache=True,
+                disable_cuda_graph=True,
+                cuda_graph_config={"decode": {"backend": "full"}},
+            )
+
+    def test_json_only_tc_piecewise_decode_accepted(self):
+        args = self._handle(
+            enable_moe_expert_cache=True,
+            cuda_graph_config={"decode": {"backend": "tc_piecewise"}},
+        )
+        self.assertEqual(args.cuda_graph_config.decode.backend, Backend.TC_PIECEWISE)
+
+    def test_prefill_full_capture_rejected(self):
+        with self.assertRaisesRegex(ValueError, "FULL prefill CUDA-graph capture"):
+            self._handle(
+                enable_moe_expert_cache=True,
+                cuda_graph_backend_decode="tc_piecewise",
+                cuda_graph_backend_prefill="full",
+            )
+
+    def test_tc_piecewise_decode_with_default_prefill_accepted(self):
+        # The engine-parity gate boots exactly this combo; it must keep
+        # booting (default prefill is breakable here, never FULL).
+        args = self._handle(
+            enable_moe_expert_cache=True,
+            cuda_graph_backend_decode="tc_piecewise",
+        )
+        self.assertEqual(args.cuda_graph_config.decode.backend, Backend.TC_PIECEWISE)
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
+
+
 class TestCutedslMoeMaxNumTokens(CustomTestCase):
     """The shared CuteDSL MoE per-forward token bound. Fields are set directly
     to exercise the math independently of __post_init__ resolution.

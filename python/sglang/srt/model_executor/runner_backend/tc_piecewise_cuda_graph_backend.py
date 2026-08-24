@@ -132,7 +132,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
             a2a_backend.is_deepep()
             or a2a_backend.is_mooncake()
             or server_args.cuda_graph_config.decode.backend == Backend.TC_PIECEWISE
-            or server_args.enable_moe_expert_cache
+            or getattr(server_args, "enable_moe_expert_cache", False)
         ):
             config.add_split_op("sglang.moe_forward_piecewise_cuda_graph_impl")
 

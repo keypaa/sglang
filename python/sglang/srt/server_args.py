@@ -4521,6 +4521,10 @@ class ServerArgs:
         self._apply_deepep_adjustments()
         self._apply_cuda_graph_disaggregation_roles()
         self._validate_cuda_graph_config()
+        # Effective-phase expert-cache gate: must run after the JSON-over-flags
+        # merge, which validate_moe_expert_cache (pre-merge, flags only) cannot
+        # see through.
+        self._reconcile_moe_expert_cache_cuda_graph()
         # Warn on the final resolved config (not inside the compat cascade —
         # that path is skipped when the user explicitly sets the backend,
         # which is the only way to get 'full' for prefill today).
@@ -4528,6 +4532,39 @@ class ServerArgs:
             logger.warning(
                 "cuda_graph_config[prefill].backend='full' is experimental. "
                 "Use breakable or tc_piecewise for production workloads."
+            )
+
+    def _reconcile_moe_expert_cache_cuda_graph(self):
+        """Authoritative expert-cache gate on the *effective* phase backends.
+
+        validate_moe_expert_cache runs before this merge and sees only the
+        convenience flags; explicit --cuda-graph-config JSON has strictly
+        higher precedence, so without this re-check a JSON decode/prefill
+        override could smuggle a FULL captured phase past the guard and die
+        later at capture time with a generic error.
+        """
+        if not self.enable_moe_expert_cache:
+            return
+        decode = self.cuda_graph_config.decode.backend
+        if decode not in (Backend.TC_PIECEWISE, Backend.DISABLED):
+            raise ValueError(
+                "--enable-moe-expert-cache requires the effective decode "
+                "CUDA-graph backend to be tc_piecewise (segmented decode "
+                "graphs) or disabled (eager), but "
+                f"cuda_graph_config[decode].backend resolved to {decode!r} "
+                "(--cuda-graph-config JSON outranks "
+                "--cuda-graph-backend-decode)."
+            )
+        prefill = self.cuda_graph_config.prefill.backend
+        if prefill == Backend.FULL:
+            raise ValueError(
+                "--enable-moe-expert-cache cannot run with FULL prefill "
+                "CUDA-graph capture (cuda_graph_config[prefill].backend="
+                f"{prefill!r} via --cuda-graph-backend-prefill or "
+                "--cuda-graph-config JSON): the captured MoE forward "
+                "host-syncs the expert cache, which is illegal during graph "
+                "capture. Use breakable/tc_piecewise prefill graphs or "
+                "--disable-prefill-cuda-graph."
             )
 
     def _apply_deepep_adjustments(self):
@@ -9909,15 +9946,37 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
     )
 
 
+def _raw_decode_graph_is_cache_safe(raw) -> bool:
+    """True if the raw --cuda-graph-config input explicitly sets
+    decode.backend to a cache-safe value (tc_piecewise / disabled).
+    That input outranks the convenience flags in the merge, so it
+    qualifies this pre-merge guard even when --cuda-graph-backend-decode
+    is unset; the authoritative effective-backend check runs post-merge
+    in ServerArgs._reconcile_moe_expert_cache_cuda_graph."""
+    if isinstance(raw, CudaGraphConfig):
+        raw = raw.to_dict()
+    if not isinstance(raw, dict):
+        return False
+    decode = raw.get(Phase.DECODE)
+    return isinstance(decode, dict) and decode.get("backend") in (
+        Backend.TC_PIECEWISE,
+        Backend.DISABLED,
+    )
+
+
 def validate_moe_expert_cache(args) -> int:
     """Validate --enable-moe-expert-cache combos; returns clamped slot count."""
     if isinstance(args, dict):
         args = SimpleNamespace(**args)
     if not args.enable_moe_expert_cache:
         return 0
-    if not getattr(args, "disable_cuda_graph", False) and getattr(
-        args, "cuda_graph_backend_decode", None
-    ) != "tc_piecewise":
+    if (
+        not getattr(args, "disable_cuda_graph", False)
+        and getattr(args, "cuda_graph_backend_decode", None) != "tc_piecewise"
+        and not _raw_decode_graph_is_cache_safe(
+            getattr(args, "cuda_graph_config", None)
+        )
+    ):
         raise ValueError(
             "--enable-moe-expert-cache requires either --disable-cuda-graph "
             "(eager) or --cuda-graph-backend-decode tc_piecewise (segmented "

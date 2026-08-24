@@ -32,6 +32,17 @@ class TestMoeExpertCacheGuards(CustomTestCase):
             == 128
         )
 
+    def test_accepts_json_only_tc_piecewise_decode(self):
+        """cuda_graph_config JSON outranks the convenience flags, so an
+        explicit decode tc_piecewise there qualifies the guard even with
+        --cuda-graph-backend-decode unset."""
+        assert (
+            validate_moe_expert_cache(
+                _args(cuda_graph_config={"decode": {"backend": "tc_piecewise"}})
+            )
+            == 128
+        )
+
     def test_accepts_tc_piecewise_with_disable_cuda_graph(self):
         assert (
             validate_moe_expert_cache(
