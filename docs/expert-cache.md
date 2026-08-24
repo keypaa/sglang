@@ -48,8 +48,10 @@ Data flow (per decode step, per layer):
    - `next_ids` are prefetched (async, overlapped) for the following layer.
 3. `step_commit()`: records the step's copy-event on the pool; releases the
    held refcounts.
-4. The captured graph waits on the step event, indexes the slot map by the
-   top-k ids, gathers pool weights, and runs the FFN.
+4. Copy→read ordering is enforced outside any captured region — the pool
+   fences pending copies before replay (a captured graph may not wait on the
+   transfer stream; see design findings below) — then the graph indexes the
+   slot map by the top-k ids, gathers pool weights, and runs the FFN.
 
 ## What changed since Phase 1
 
@@ -96,8 +98,11 @@ Flags:
 Constraints (enforced by `validate_moe_expert_cache` + model-init guards,
 fail fast at startup):
 
-- **Eager only**: requires `--disable-cuda-graph` (the router runs inside the
-  captured decode graph; graph-safe design is future work).
+- **Graph mode**: either `--disable-cuda-graph` (eager decode, unchanged M1/M2
+  behavior) or segmented decode graphs via
+  `--cuda-graph-backend-decode tc_piecewise`. Full, breakable, and unset
+  decode backends are rejected at startup with a message naming both allowed
+  options.
 - **TP=1 / EP=1** only.
 - **Quantization**: bf16 (unquantized) or **fp8 block-wise** checkpoints
   (`is_checkpoint_fp8_serialized`, 128×128 `weight_scale_inv` blocks) — on
@@ -122,6 +127,29 @@ Telemetry: each layer's `LayerRuntime.telemetry()` returns
 - `hits`, `misses`, `loads` — from the shared `ExpertCache` stats;
 - `stall_ms_total`, `stall_ms_last` — wall time inside `ensure_resident`
   while copies were pending; an all-hit call resets `stall_ms_last` to 0.
+
+Under tc_piecewise graphs the per-replay prepare hook adds a small
+per-MoE-layer cost in the segment gap on every decode step — host id read,
+residency, fence, remap — on top of these counters.
+
+## Phase 3 milestone 3: CUDA-graph-safe decode (tc_piecewise)
+
+You can now leave CUDA graphs on. Besides the eager configuration above,
+`validate_moe_expert_cache` accepts cache-on when the decode graph backend is
+`tc_piecewise` (`--cuda-graph-backend-decode tc_piecewise`). Each cached MoE
+layer registers a split point (`expert_cache_prepare` in
+`piecewise_hook.py`) whose body re-executes as Python in the segment gap on
+every decode-step replay:
+
+1. Read the routed ids on host (`topk_ids.tolist()`).
+2. `ensure_resident` streams missing experts into pool slots.
+3. Fence pending H2D copies and refresh the device slot map.
+4. Return slot-remapped ids; the captured MoE piece gathers pool rows by them.
+
+No weight bytes move inside any captured graph, and the residency fence stays
+outside capture — a captured graph still cannot wait on the transfer stream.
+Cross-layer/token prefetch pipelining remains out of scope: demand misses are
+served only at segment gaps.
 
 ## Verification status
 
