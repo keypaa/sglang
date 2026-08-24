@@ -23,6 +23,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import unittest
 from contextlib import contextmanager
 
@@ -50,6 +51,27 @@ _SEED_WEIGHTS = 1234
 
 _PROMPT_TOKEN_IDS = [[7, 11, 13], [42, 5], [90, 3, 21, 57]]
 _NEW_TOKENS = 16
+_LAUNCH_DEADLINE_S = 600
+_GENERATE_DEADLINE_S = 300
+
+
+def _with_deadline(label: str, deadline_s: int, fn):
+    result = {}
+
+    def _worker():
+        try:
+            result["value"] = fn()
+        except BaseException as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    thread.join(deadline_s)
+    if thread.is_alive():
+        raise TimeoutError(f"{label} exceeded its {deadline_s}s deadline")
+    if "error" in result:
+        raise result["error"]
+    return result["value"]
 
 
 def _config_dict(hidden: int, inter: int) -> dict:
@@ -326,11 +348,19 @@ def _write_checkpoints(root: str, quant_config, hidden: int, inter: int):
 def _generate_token_ids(ckpt_dir: str, cache_enabled: bool):
     from sglang import Engine
 
-    engine = Engine(model_path=ckpt_dir, **_engine_kwargs(cache_enabled))
+    engine = _with_deadline(
+        "engine launch",
+        _LAUNCH_DEADLINE_S,
+        lambda: Engine(model_path=ckpt_dir, **_engine_kwargs(cache_enabled)),
+    )
     try:
-        outputs = engine.generate(
-            input_ids=_PROMPT_TOKEN_IDS,
-            sampling_params={"temperature": 0, "max_new_tokens": _NEW_TOKENS},
+        outputs = _with_deadline(
+            "generation",
+            _GENERATE_DEADLINE_S,
+            lambda: engine.generate(
+                input_ids=_PROMPT_TOKEN_IDS,
+                sampling_params={"temperature": 0, "max_new_tokens": _NEW_TOKENS},
+            ),
         )
     finally:
         engine.shutdown()
