@@ -28,11 +28,9 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 import tqdm
-
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compile import install_torch_compiled
-from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.compilation.compile_phase import (
     enable_torch_compile_warmup,
     set_pcg_capture_stream,
@@ -41,6 +39,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )

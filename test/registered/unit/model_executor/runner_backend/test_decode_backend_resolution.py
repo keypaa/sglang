@@ -5,6 +5,9 @@ Covers the two wiring gaps that make an explicit
 
   * ``resolve_decode_backend`` must return ``TcPiecewiseCudaGraphBackend``
     instead of silently falling back to FULL.
+  * Runners without tc_piecewise support (speculative draft runners lack
+    ``_run_dummy_forward`` / ``capture_num_tokens``) must fall back to FULL
+    with a one-shot warning, preserving pre-tc_piecewise behavior.
   * ``TcPiecewiseCudaGraphBackend.build_compilation_config`` must register
     ``sglang.moe_forward_piecewise_cuda_graph_impl`` as a split op for
     expert-cache configs (plain TP, a2a none), while default configs stay
@@ -20,6 +23,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     PhaseConfig,
 )
+from sglang.srt.model_executor.runner_backend import (
+    utils as runner_backend_utils,
+)
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -32,6 +38,8 @@ _UTILS = "sglang.srt.model_executor.runner_backend.utils"
 
 
 def _make_runner(decode_backend):
+    """DecodeCudaGraphRunner-shaped: provides everything
+    TcPiecewiseCudaGraphBackend touches during __init__."""
     server_args = SimpleNamespace(
         cuda_graph_config=CudaGraphConfig(
             decode=PhaseConfig(backend=decode_backend),
@@ -43,8 +51,22 @@ def _make_runner(decode_backend):
         debug_cuda_graph=False,
     )
     return SimpleNamespace(
-        model_runner=SimpleNamespace(server_args=server_args, device="cuda")
+        model_runner=SimpleNamespace(server_args=server_args, device="cuda"),
+        _run_dummy_forward=lambda num_tokens: None,
+        capture_num_tokens=[64, 128],
+        capture_bs=[1, 2],
+        captured_req_width=2,
     )
+
+
+def _make_draft_runner(decode_backend):
+    """Speculative-draft-runner-shaped (EAGLE/MTP): has the buffer/capture
+    attributes but no ``_run_dummy_forward`` / ``capture_num_tokens``, so it
+    cannot drive the tc_piecewise compile pass."""
+    runner = _make_runner(decode_backend)
+    del runner._run_dummy_forward
+    del runner.capture_num_tokens
+    return runner
 
 
 def _make_server_args(
@@ -112,6 +134,41 @@ class TestResolveDecodeBackend(CustomTestCase):
             backend = resolve_decode_backend(runner)
 
         self.assertIs(backend, sentinel)
+
+
+class TestTcPiecewiseCapabilityGuard(CustomTestCase):
+    def setUp(self):
+        runner_backend_utils._TC_PIECEWISE_DECODE_FALLBACK_LOGGED = False
+
+    def test_decode_runner_shaped_resolves_tc_piecewise(self):
+        runner = _make_runner(Backend.TC_PIECEWISE)
+        with patch(f"{_UTILS}.TcPiecewiseCudaGraphBackend") as mock_tc:
+            backend = resolve_decode_backend(runner)
+
+        self.assertIs(backend, mock_tc.return_value)
+        mock_tc.assert_called_once_with(runner)
+
+    def test_draft_runner_shaped_falls_back_to_full_with_warning(self):
+        runner = _make_draft_runner(Backend.TC_PIECEWISE)
+        with patch(f"{_UTILS}.TcPiecewiseCudaGraphBackend") as mock_tc, patch(
+            f"{_UTILS}.FullCudaGraphBackend"
+        ) as mock_full:
+            with self.assertLogs(_UTILS, level="WARNING") as logs:
+                backend = resolve_decode_backend(runner)
+
+        self.assertIs(backend, mock_full.return_value)
+        mock_full.assert_called_once_with(runner, enable_memory_saver=False)
+        mock_tc.assert_not_called()
+        self.assertIn("_run_dummy_forward", logs.output[0])
+
+    def test_draft_runner_fallback_warns_only_once(self):
+        runner = _make_draft_runner(Backend.TC_PIECEWISE)
+        with patch(f"{_UTILS}.TcPiecewiseCudaGraphBackend"), patch(
+            f"{_UTILS}.FullCudaGraphBackend"
+        ):
+            with self.assertLogs(_UTILS, level="WARNING"):
+                resolve_decode_backend(runner)
+            resolve_decode_backend(runner)
 
 
 class TestBuildCompilationConfigMoeSplitOp(CustomTestCase):

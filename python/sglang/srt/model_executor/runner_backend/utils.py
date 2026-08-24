@@ -45,6 +45,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Runner attributes TcPiecewiseCudaGraphBackend touches unconditionally
+# during __init__ / _run_compile_pass. Speculative draft runners (EAGLE,
+# MTP) lack them and fall back to Full.
+_TC_PIECEWISE_REQUIRED_RUNNER_ATTRS = ("_run_dummy_forward", "capture_num_tokens")
+
+# Track first occurrence of the fallback warning to avoid log spam.
+_TC_PIECEWISE_DECODE_FALLBACK_LOGGED = False
+
 
 def resolve_decode_backend(
     cuda_graph_runner: BaseCudaGraphRunner,
@@ -86,7 +94,22 @@ def resolve_decode_backend(
             debug_eager=model_runner.server_args.debug_cuda_graph,
         )
     if backend_name == Backend.TC_PIECEWISE:
-        return TcPiecewiseCudaGraphBackend(cuda_graph_runner)
+        global _TC_PIECEWISE_DECODE_FALLBACK_LOGGED
+        missing = [
+            attr
+            for attr in _TC_PIECEWISE_REQUIRED_RUNNER_ATTRS
+            if not hasattr(cuda_graph_runner, attr)
+        ]
+        if not missing:
+            return TcPiecewiseCudaGraphBackend(cuda_graph_runner)
+        if not _TC_PIECEWISE_DECODE_FALLBACK_LOGGED:
+            logger.warning(
+                "%s does not support decode='tc_piecewise' (missing %s); "
+                "falling back to 'full'.",
+                type(cuda_graph_runner).__name__,
+                ", ".join(missing),
+            )
+            _TC_PIECEWISE_DECODE_FALLBACK_LOGGED = True
     return FullCudaGraphBackend(
         cuda_graph_runner, enable_memory_saver=enable_memory_saver
     )

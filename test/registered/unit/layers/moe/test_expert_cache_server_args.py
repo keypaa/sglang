@@ -1,7 +1,6 @@
 """CPU units for --enable-moe-expert-cache startup guards."""
 
 import pytest
-
 from sglang.srt.server_args import validate_moe_expert_cache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -59,6 +58,21 @@ class TestMoeExpertCacheGuards(CustomTestCase):
             validate_moe_expert_cache(
                 _args(cuda_graph_backend_decode="disabled")
             )
+
+    def test_bootable_cache_on_decodes_are_eager_or_tc_piecewise(self):
+        """decode=full with cache-on is rejected at startup, so the
+        ``enable_moe_expert_cache`` term in
+        TcPiecewiseCudaGraphBackend.build_compilation_config's split-op
+        predicate only ever evaluates on bootable configs."""
+        with pytest.raises(ValueError, match="tc_piecewise"):
+            validate_moe_expert_cache(_args(cuda_graph_backend_decode="full"))
+        assert validate_moe_expert_cache(_args(disable_cuda_graph=True)) == 128
+        assert (
+            validate_moe_expert_cache(
+                _args(cuda_graph_backend_decode="tc_piecewise")
+            )
+            == 128
+        )
 
     def test_rejects_tp(self):
         with pytest.raises(ValueError, match="tp-size"):
