@@ -12,7 +12,6 @@ from __future__ import annotations
 from typing import Dict
 
 import torch
-
 from sglang.srt.layers.moe.expert_cache.layer_runtime import LayerRuntime
 from sglang.srt.layers.moe.expert_cache.slot_remap import remap_topk_ids
 from sglang.srt.utils.custom_op import register_custom_op
@@ -24,6 +23,12 @@ _EXPERT_CACHE_RUNTIMES: Dict[int, LayerRuntime] = {}
 
 
 def register_expert_cache_runtime(layer_id: int, runtime: LayerRuntime) -> None:
+    existing = _EXPERT_CACHE_RUNTIMES.get(layer_id)
+    if existing is not None and existing is not runtime:
+        raise ValueError(
+            f"expert-cache runtime for layer {layer_id} is already registered "
+            "as a different object"
+        )
     _EXPERT_CACHE_RUNTIMES[layer_id] = runtime
 
 

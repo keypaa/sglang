@@ -27,9 +27,6 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-from transformers import PretrainedConfig
-
 from sglang.kernels.ops.attention.dsv4 import (
     silu_and_mul_clamp,
     silu_and_mul_contig_post_quant,
@@ -103,6 +100,11 @@ from sglang.srt.layers.moe import (
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.expert_cache.piecewise_hook import (
+    expert_cache_prepare,
+    register_expert_cache_runtime,
+    unregister_expert_cache_runtime,
+)
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
@@ -218,6 +220,8 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from torch import nn
+from transformers import PretrainedConfig
 
 if _use_aiter:
     from sglang.srt.layers.rocm_linear_utils import aiter_dsv3_router_gemm
@@ -1360,14 +1364,22 @@ class DeepseekV2MoE(nn.Module):
                     f"layer {self.layer_id}: expert cache requires "
                     f"TopKOutputFormat.STANDARD, got {topk_output.format}"
                 )
-            from sglang.srt.layers.moe.expert_cache import remap_topk_ids
+            if is_in_tc_piecewise_cuda_graph():
+                # Split custom op: its body re-executes as Python on every
+                # decode-step replay, so it must be invoked through the
+                # registered torch op handle — calling the python impl would
+                # be traced into the captured piece instead of forming the
+                # replay-time split boundary.
+                slot_ids = expert_cache_prepare(topk_output.topk_ids, self.layer_id)
+            else:
+                from sglang.srt.layers.moe.expert_cache import remap_topk_ids
 
-            ids_host = topk_output.topk_ids.to(torch.long).reshape(-1).tolist()
-            expert_cache_runtime.ensure_resident(sorted(set(ids_host)))
-            slot_ids = remap_topk_ids(
-                topk_output.topk_ids,
-                expert_cache_runtime.slot_map_device(topk_output.topk_ids.device),
-            )
+                ids_host = topk_output.topk_ids.to(torch.long).reshape(-1).tolist()
+                expert_cache_runtime.ensure_resident(sorted(set(ids_host)))
+                slot_ids = remap_topk_ids(
+                    topk_output.topk_ids,
+                    expert_cache_runtime.slot_map_device(topk_output.topk_ids.device),
+                )
             topk_output = topk_output._replace(topk_ids=slot_ids)
 
         if pre_quant_input is not None:
@@ -3392,6 +3404,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             getattr(get_server_args(), "enable_moe_expert_cache", False)
         )
         if intercept_expert_weights:
+            self._teardown_expert_cache_wiring()
             self._moe_expert_cache_infra = None
             self._moe_expert_cache_pending = {}
             weights = self._make_expert_cache_interceptor(weights)
@@ -3528,11 +3541,20 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 entry.get("w2_scale"),
             )
         self._moe_expert_cache_pending = {}
+        # Every layer's runtime is live only once the whole shard's weights
+        # are pinned: replays look runtimes up here, so a half-loaded
+        # generation must never be visible in the registry.
+        for moe in self._expert_cache_moe_layers():
+            register_expert_cache_runtime(moe.layer_id, moe.expert_cache_runtime)
         log_info_on_rank0(
             logger,
             f"Expert cache: pinned {store.total_bytes / 2**30:.2f} GiB of "
             "routed-expert weights in host RAM",
         )
+
+    def _teardown_expert_cache_wiring(self) -> None:
+        for moe in self._expert_cache_moe_layers():
+            unregister_expert_cache_runtime(moe.layer_id)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

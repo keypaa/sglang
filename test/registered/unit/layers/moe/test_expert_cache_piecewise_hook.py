@@ -5,7 +5,6 @@ decode-step replay (Phase 3, M3, Task 2)."""
 import unittest
 
 import torch
-
 from sglang.srt.layers.moe.expert_cache import (
     ExpertCache,
     ExpertHostStore,
@@ -170,6 +169,21 @@ class TestRegistryHelpers(CustomTestCase):
 
     def test_unregister_absent_layer_is_a_noop(self):
         unregister_expert_cache_runtime(4096)
+
+    def test_duplicate_registration_of_different_runtime_raises(self):
+        # Double-wiring bug guard: two live runtimes for one layer would make
+        # replays stream slots through whichever was registered last.
+        device_map = torch.full((NUM_EXPERTS,), -1, dtype=torch.int32)
+        register_expert_cache_runtime(51, _RecordingRuntime(device_map))
+        self.addCleanup(unregister_expert_cache_runtime, 51)
+        with self.assertRaises(ValueError):
+            register_expert_cache_runtime(51, _RecordingRuntime(device_map))
+
+    def test_reregistering_same_runtime_is_idempotent(self):
+        rt = _RecordingRuntime(torch.full((NUM_EXPERTS,), -1, dtype=torch.int32))
+        register_expert_cache_runtime(52, rt)
+        self.addCleanup(unregister_expert_cache_runtime, 52)
+        register_expert_cache_runtime(52, rt)
 
 
 class TestSplitOpRegistration(CustomTestCase):

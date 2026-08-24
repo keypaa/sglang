@@ -3,9 +3,9 @@
 import os
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
-
 from sglang.srt.layers.moe.expert_cache import (
     ExpertCache,
     ExpertHostStore,
@@ -16,7 +16,16 @@ from sglang.srt.layers.moe.expert_cache import (
     make_policy,
 )
 from sglang.srt.layers.moe.expert_cache.layer_runtime import LayerRuntime
+from sglang.srt.layers.moe.expert_cache.piecewise_hook import (
+    _EXPERT_CACHE_RUNTIMES,
+    expert_cache_prepare_impl,
+    register_expert_cache_runtime,
+    unregister_expert_cache_runtime,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    enable_tc_piecewise_cuda_graph,
+)
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -508,6 +517,296 @@ class TestWiringSmoke(CustomTestCase):
             with self.assertRaises(ValueError) as cm:
                 shim._finish_expert_cache_wiring()
             self.assertIn("weight_scale_inv", str(cm.exception))
+
+
+_DSV2 = "sglang.srt.models.deepseek_v2"
+
+
+class TestPiecewiseRegistryWiring(CustomTestCase):
+    """_finish/_teardown populate and clear the per-replay hook registry."""
+
+    def _wiring_shim(self, moes):
+        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+
+        shim = object.__new__(DeepseekV2ForCausalLM)
+        shim.config = SimpleNamespace(
+            num_hidden_layers=len(moes),
+            n_routed_experts=_NUM_EXPERTS,
+            num_experts_per_tok=2,
+            hidden_size=_HIDDEN,
+            moe_intermediate_size=_INTER,
+        )
+        shim.model = SimpleNamespace(
+            start_layer=0,
+            end_layer=len(moes),
+            layers=[SimpleNamespace(mlp=moe) for moe in moes],
+        )
+        return shim
+
+    def _finish_two_layer_wiring(self):
+        with _tp1_parallel(), _cache_server_args():
+            moes = [
+                DeepseekV2MoE(
+                    config=_tiny_config(),
+                    layer_id=i,
+                    quant_config=None,
+                    prefix=f"model.layers.{i}.mlp",
+                )
+                for i in range(2)
+            ]
+            shim = self._wiring_shim(moes)
+            shim._moe_expert_cache_pending = {}
+            shim._build_expert_cache_infra()
+            shim._finish_expert_cache_wiring()
+        return moes
+
+    def test_finish_registers_every_layer_runtime(self):
+        moes = self._finish_two_layer_wiring()
+        try:
+            for moe in moes:
+                self.assertIsNotNone(moe.expert_cache_runtime)
+                self.assertIs(
+                    _EXPERT_CACHE_RUNTIMES[moe.layer_id], moe.expert_cache_runtime
+                )
+        finally:
+            for moe in moes:
+                unregister_expert_cache_runtime(moe.layer_id)
+
+    def test_teardown_unregisters_every_layer_runtime(self):
+        moes = self._finish_two_layer_wiring()
+        self._wiring_shim(moes)._teardown_expert_cache_wiring()
+        for moe in moes:
+            self.assertNotIn(moe.layer_id, _EXPERT_CACHE_RUNTIMES)
+
+    def test_load_weights_entry_clears_stale_registry_entries(self):
+        # A reload rebuilds every runtime; a stale registry entry surviving
+        # into the next generation would stream replays through dead objects.
+        with _tp1_parallel(), _cache_server_args():
+            moe = DeepseekV2MoE(
+                config=_tiny_config(),
+                layer_id=0,
+                quant_config=None,
+                prefix="model.layers.0.mlp",
+            )
+            shim = self._wiring_shim([moe])
+            register_expert_cache_runtime(0, object())
+            self.addCleanup(unregister_expert_cache_runtime, 0)
+            do_load_calls = []
+
+            def _record_do_load(weights, is_nextn=False):
+                do_load_calls.append(1)
+
+            shim.do_load_weights = _record_do_load
+            shim.load_weights([])
+            self.assertEqual(len(do_load_calls), 1)
+            self.assertNotIn(0, _EXPERT_CACHE_RUNTIMES)
+
+
+class _RecordingExperts(torch.nn.Module):
+    """Stands in for FusedMoE: records the topk_ids it would consume."""
+
+    def __init__(self):
+        super().__init__()
+        self.quant_method = None
+        self.moe_runner_config = SimpleNamespace(inplace=False)
+        self.topk_ids_received = []
+
+    def forward(self, hidden_states, topk_output, pre_quant_input=None):
+        self.topk_ids_received.append(topk_output.topk_ids.clone())
+        return hidden_states
+
+
+def _cpu_pool_runtime(moe):
+    spec = ModelSpec(
+        num_layers=moe.layer_id + 1,
+        num_experts=_NUM_EXPERTS,
+        top_k=2,
+        shared_experts=0,
+        hidden_size=_HIDDEN,
+        intermediate_size=_INTER,
+    )
+    cache = ExpertCache(
+        spec, HardwareSpec(), make_policy("lru", _NUM_SLOTS), SimBackend(1e12)
+    )
+    store = ExpertHostStore(num_layers=moe.layer_id + 1, num_experts=_NUM_EXPERTS)
+    for e in range(_NUM_EXPERTS):
+        store.put(
+            ExpertKey(moe.layer_id, e),
+            torch.randn(2 * _INTER, _HIDDEN),
+            torch.randn(_HIDDEN, _INTER),
+        )
+    return LayerRuntime(
+        moe.layer_id,
+        cache,
+        store,
+        moe.experts.w13_weight.data,
+        moe.experts.w2_weight.data,
+        num_experts=_NUM_EXPERTS,
+        num_layers=moe.layer_id + 1,
+    )
+
+
+class TestPiecewiseForwardBranch(CustomTestCase):
+    """forward_normal must route through the prepare op exactly when the
+    tc_piecewise context is active AND the cache is enabled."""
+
+    LAYER_ID = 7
+
+    def _cache_moe_with_recorder(self):
+        with _tp1_parallel(), _cache_server_args():
+            moe = DeepseekV2MoE(
+                config=_tiny_config(),
+                layer_id=self.LAYER_ID,
+                quant_config=None,
+                prefix=f"model.layers.{self.LAYER_ID}.mlp",
+            )
+            moe.expert_cache_runtime = _cpu_pool_runtime(moe)
+            register_expert_cache_runtime(self.LAYER_ID, moe.expert_cache_runtime)
+            self.addCleanup(unregister_expert_cache_runtime, self.LAYER_ID)
+            recorder = _RecordingExperts()
+            moe.experts = recorder
+        return moe, recorder
+
+    def test_tc_piecewise_context_routes_topk_ids_through_hook(self):
+        moe, recorder = self._cache_moe_with_recorder()
+        seen = {}
+
+        def spy(topk_ids, layer_id):
+            out = expert_cache_prepare_impl(topk_ids, layer_id)
+            seen["slot_ids"] = out
+            return out
+
+        with _tp1_parallel(), _cache_server_args(), patch(
+            _DSV2 + ".expert_cache_prepare", side_effect=spy, create=True
+        ) as hook, enable_tc_piecewise_cuda_graph():
+            moe.forward_normal(torch.randn(3, _HIDDEN), skip_shared_experts=True)
+
+        hook.assert_called_once()
+        ids_arg, layer_arg = hook.call_args.args
+        self.assertEqual(layer_arg, self.LAYER_ID)
+        sent = recorder.topk_ids_received[0]
+        self.assertEqual(sent.shape, ids_arg.shape)
+        self.assertEqual(sent.dtype, ids_arg.dtype)
+        self.assertTrue(torch.equal(sent, seen["slot_ids"]))
+
+    def test_eager_context_does_not_invoke_hook(self):
+        moe, recorder = self._cache_moe_with_recorder()
+        with _tp1_parallel(), _cache_server_args(), patch(
+            _DSV2 + ".expert_cache_prepare",
+            side_effect=expert_cache_prepare_impl,
+            create=True,
+        ) as hook:
+            moe.forward_normal(torch.randn(3, _HIDDEN), skip_shared_experts=True)
+
+        hook.assert_not_called()
+        self.assertEqual(len(recorder.topk_ids_received), 1)
+        self.assertLess(int(recorder.topk_ids_received[0].max()), _NUM_SLOTS)
+
+    def test_cache_off_under_piecewise_never_invokes_hook(self):
+        plain_args = get_context().override_server_args(
+            enable_moe_expert_cache=False,
+            disable_cuda_graph=True,
+            disable_shared_experts_fusion=True,
+            ep_num_redundant_experts=0,
+        )
+        with _tp1_parallel(), plain_args:
+            moe = DeepseekV2MoE(
+                config=_tiny_config(),
+                layer_id=self.LAYER_ID,
+                quant_config=None,
+                prefix=f"model.layers.{self.LAYER_ID}.mlp",
+            )
+            self.assertFalse(moe.expert_cache_enabled)
+            moe.experts = _RecordingExperts()
+            with patch(
+                _DSV2 + ".expert_cache_prepare",
+                side_effect=expert_cache_prepare_impl,
+                create=True,
+            ) as hook, enable_tc_piecewise_cuda_graph():
+                moe.forward_normal(torch.randn(3, _HIDDEN), skip_shared_experts=True)
+
+        hook.assert_not_called()
+        self.assertNotIn(self.LAYER_ID, _EXPERT_CACHE_RUNTIMES)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestPiecewiseForwardSmoke(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", _free_master_port())
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        os.environ.setdefault("LOCAL_RANK", "0")
+
+        from sglang.srt.distributed.parallel_state import (
+            init_distributed_environment,
+            initialize_model_parallel,
+            model_parallel_is_initialized,
+        )
+
+        if not torch.distributed.is_initialized():
+            init_distributed_environment(
+                world_size=1, rank=0, local_rank=0, backend="gloo"
+            )
+        if not model_parallel_is_initialized():
+            initialize_model_parallel(
+                tensor_model_parallel_size=1,
+                expert_model_parallel_size=1,
+                pipeline_model_parallel_size=1,
+                backend="gloo",
+            )
+
+    def test_piecewise_forward_takes_prepare_hook_once(self):
+        piecewise_args = get_context().override_server_args(
+            enable_moe_expert_cache=True,
+            moe_cache_slots=_NUM_SLOTS,
+            cuda_graph_backend_decode="tc_piecewise",
+            disable_shared_experts_fusion=True,
+            ep_num_redundant_experts=0,
+        )
+
+        with _tp1_parallel(), piecewise_args:
+            moe_bf16 = _build_tiny_test_moe().bfloat16()
+            w13 = moe_bf16.experts.w13_weight.data
+            w2 = moe_bf16.experts.w2_weight.data
+            spec = ModelSpec(
+                num_layers=1,
+                num_experts=_NUM_EXPERTS,
+                top_k=2,
+                shared_experts=0,
+                hidden_size=_HIDDEN,
+                intermediate_size=_INTER,
+            )
+            spec.bytes_on_disk = spec.num_layers * spec.num_experts * 1024
+            cache = ExpertCache(
+                spec, HardwareSpec(), make_policy("lru", _NUM_SLOTS), SimBackend(1e12)
+            )
+            store = ExpertHostStore(num_layers=1, num_experts=_NUM_EXPERTS)
+            for e in range(_NUM_EXPERTS):
+                store.put(
+                    ExpertKey(0, e),
+                    torch.randn_like(w13[0]),
+                    torch.randn_like(w2[0]),
+                )
+            runtime = LayerRuntime(
+                0, cache, store, w13, w2, num_experts=_NUM_EXPERTS, num_layers=1
+            )
+            register_expert_cache_runtime(0, runtime)
+            self.addCleanup(unregister_expert_cache_runtime, 0)
+            runtime.ensure_resident(list(range(_NUM_SLOTS)))
+
+            hidden = torch.randn(3, _HIDDEN, device="cuda", dtype=torch.bfloat16)
+            with patch(
+                _DSV2 + ".expert_cache_prepare",
+                side_effect=expert_cache_prepare_impl,
+                create=True,
+            ) as hook, enable_tc_piecewise_cuda_graph():
+                output = moe_bf16.forward_normal(hidden, skip_shared_experts=True)
+
+        self.assertEqual(hook.call_count, 1)
+        self.assertEqual(hook.call_args.args[1], 0)
+        self.assertEqual(output.shape, (3, _HIDDEN))
 
 
 if __name__ == "__main__":
