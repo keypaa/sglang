@@ -25,6 +25,7 @@ from sglang.srt.layers.moe.expert_cache.piecewise_hook import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     enable_tc_piecewise_cuda_graph,
+    set_tc_piecewise_forward_context,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -824,11 +825,21 @@ class TestPiecewiseForwardSmoke(CustomTestCase):
             runtime.ensure_resident(list(range(_NUM_SLOTS)))
 
             hidden = torch.randn(3, _HIDDEN, device="cuda", dtype=torch.bfloat16)
+            # The MoE split op resolves its layer through the forward context,
+            # which production installs in TcPiecewiseCudaGraphBackend. The
+            # context manager restores None on exit, so nothing leaks.
+            forward_ctx = set_tc_piecewise_forward_context(
+                forward_batch=None,
+                attention_layers=[],
+                quant_config=None,
+                moe_layers=[moe_bf16.experts],
+                moe_fusions=[],
+            )
             with patch(
                 _DSV2 + ".expert_cache_prepare",
                 side_effect=expert_cache_prepare_impl,
                 create=True,
-            ) as hook, enable_tc_piecewise_cuda_graph():
+            ) as hook, enable_tc_piecewise_cuda_graph(), forward_ctx:
                 output = moe_bf16.forward_normal(hidden, skip_shared_experts=True)
 
         self.assertEqual(hook.call_count, 1)
