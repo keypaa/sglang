@@ -815,6 +815,10 @@ class TestPiecewiseForwardSmoke(CustomTestCase):
             runtime = LayerRuntime(
                 0, cache, store, w13, w2, num_experts=_NUM_EXPERTS, num_layers=1
             )
+            # forward_normal reads the runtime off the module (the guard at
+            # the top of the expert-cache block); the registry alone is not
+            # enough — mirroring what _build_expert_cache_infra attaches.
+            moe_bf16.expert_cache_runtime = runtime
             register_expert_cache_runtime(0, runtime)
             self.addCleanup(unregister_expert_cache_runtime, 0)
             runtime.ensure_resident(list(range(_NUM_SLOTS)))
