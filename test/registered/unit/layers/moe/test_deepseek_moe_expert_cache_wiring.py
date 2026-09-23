@@ -486,6 +486,10 @@ class TestWiringSmoke(CustomTestCase):
             )
 
             shim._finish_expert_cache_wiring()
+            # _finish publishes every layer runtime into the process-global
+            # hook registry; drop this generation at teardown so later tests
+            # (registry wiring, forward branch, smoke) start from clean state.
+            self.addCleanup(unregister_expert_cache_runtime, 0)
             entry = moe.expert_cache_runtime.store.get(ExpertKey(0, expert_index))
             # Store entries are pinned-CPU snapshots; the local tensors were
             # created under a torch.device("cuda") context.
@@ -616,7 +620,18 @@ class _RecordingExperts(torch.nn.Module):
         return hidden_states
 
 
-def _cpu_pool_runtime(moe):
+def _device_dtype():
+    # Decision-logic tests must run wherever the suite runs: the CUDA topk
+    # path rejects CPU tensors, so build and drive the moe on CUDA when it
+    # exists (bf16, like serving) and stay float32 on CPU-only machines.
+    cuda = torch.cuda.is_available()
+    return torch.device("cuda" if cuda else "cpu"), torch.bfloat16 if cuda else torch.float32
+
+
+def _pool_runtime_for(moe):
+    """Real LayerRuntime over the tiny pool weights (device follows moe)."""
+    pool_w13 = moe.experts.w13_weight.data
+    pool_w2 = moe.experts.w2_weight.data
     spec = ModelSpec(
         num_layers=moe.layer_id + 1,
         num_experts=_NUM_EXPERTS,
@@ -632,15 +647,15 @@ def _cpu_pool_runtime(moe):
     for e in range(_NUM_EXPERTS):
         store.put(
             ExpertKey(moe.layer_id, e),
-            torch.randn(2 * _INTER, _HIDDEN),
-            torch.randn(_HIDDEN, _INTER),
+            torch.randn_like(pool_w13[0]),
+            torch.randn_like(pool_w2[0]),
         )
     return LayerRuntime(
         moe.layer_id,
         cache,
         store,
-        moe.experts.w13_weight.data,
-        moe.experts.w2_weight.data,
+        pool_w13,
+        pool_w2,
         num_experts=_NUM_EXPERTS,
         num_layers=moe.layer_id + 1,
     )
@@ -653,22 +668,26 @@ class TestPiecewiseForwardBranch(CustomTestCase):
     LAYER_ID = 7
 
     def _cache_moe_with_recorder(self):
-        with _tp1_parallel(), _cache_server_args():
+        device, dtype = _device_dtype()
+        with _tp1_parallel(), _cache_server_args(), device:
             moe = DeepseekV2MoE(
                 config=_tiny_config(),
                 layer_id=self.LAYER_ID,
                 quant_config=None,
                 prefix=f"model.layers.{self.LAYER_ID}.mlp",
             )
-            moe.expert_cache_runtime = _cpu_pool_runtime(moe)
+            if device.type == "cuda":
+                moe = moe.bfloat16()
+            moe.expert_cache_runtime = _pool_runtime_for(moe)
             register_expert_cache_runtime(self.LAYER_ID, moe.expert_cache_runtime)
             self.addCleanup(unregister_expert_cache_runtime, self.LAYER_ID)
             recorder = _RecordingExperts()
             moe.experts = recorder
-        return moe, recorder
+            hidden = torch.randn(3, _HIDDEN, device=device, dtype=dtype)
+        return moe, recorder, hidden
 
     def test_tc_piecewise_context_routes_topk_ids_through_hook(self):
-        moe, recorder = self._cache_moe_with_recorder()
+        moe, recorder, hidden = self._cache_moe_with_recorder()
         seen = {}
 
         def spy(topk_ids, layer_id):
@@ -679,7 +698,7 @@ class TestPiecewiseForwardBranch(CustomTestCase):
         with _tp1_parallel(), _cache_server_args(), patch(
             _DSV2 + ".expert_cache_prepare", side_effect=spy, create=True
         ) as hook, enable_tc_piecewise_cuda_graph():
-            moe.forward_normal(torch.randn(3, _HIDDEN), skip_shared_experts=True)
+            moe.forward_normal(hidden, skip_shared_experts=True)
 
         hook.assert_called_once()
         ids_arg, layer_arg = hook.call_args.args
@@ -690,13 +709,13 @@ class TestPiecewiseForwardBranch(CustomTestCase):
         self.assertTrue(torch.equal(sent, seen["slot_ids"]))
 
     def test_eager_context_does_not_invoke_hook(self):
-        moe, recorder = self._cache_moe_with_recorder()
+        moe, recorder, hidden = self._cache_moe_with_recorder()
         with _tp1_parallel(), _cache_server_args(), patch(
             _DSV2 + ".expert_cache_prepare",
             side_effect=expert_cache_prepare_impl,
             create=True,
         ) as hook:
-            moe.forward_normal(torch.randn(3, _HIDDEN), skip_shared_experts=True)
+            moe.forward_normal(hidden, skip_shared_experts=True)
 
         hook.assert_not_called()
         self.assertEqual(len(recorder.topk_ids_received), 1)
@@ -709,21 +728,25 @@ class TestPiecewiseForwardBranch(CustomTestCase):
             disable_shared_experts_fusion=True,
             ep_num_redundant_experts=0,
         )
-        with _tp1_parallel(), plain_args:
+        device, dtype = _device_dtype()
+        with _tp1_parallel(), plain_args, device:
             moe = DeepseekV2MoE(
                 config=_tiny_config(),
                 layer_id=self.LAYER_ID,
                 quant_config=None,
                 prefix=f"model.layers.{self.LAYER_ID}.mlp",
             )
+            if device.type == "cuda":
+                moe = moe.bfloat16()
             self.assertFalse(moe.expert_cache_enabled)
             moe.experts = _RecordingExperts()
+            hidden = torch.randn(3, _HIDDEN, device=device, dtype=dtype)
             with patch(
                 _DSV2 + ".expert_cache_prepare",
                 side_effect=expert_cache_prepare_impl,
                 create=True,
             ) as hook, enable_tc_piecewise_cuda_graph():
-                moe.forward_normal(torch.randn(3, _HIDDEN), skip_shared_experts=True)
+                moe.forward_normal(hidden, skip_shared_experts=True)
 
         hook.assert_not_called()
         self.assertNotIn(self.LAYER_ID, _EXPERT_CACHE_RUNTIMES)
