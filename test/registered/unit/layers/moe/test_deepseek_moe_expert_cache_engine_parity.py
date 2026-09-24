@@ -16,6 +16,8 @@ expert-cache pool-as-weights path under segmented decode graphs.
 
 Checkpoints are written to temp dirs (config.json + model.safetensors) and
 loaded through the standard model loader, exactly like production serving.
+The fabricated config carries one shared expert like production DeepSeek
+models, emitted in the canonical split layout in both checkpoint dirs.
 Engines run with skip_tokenizer_init=True so no tokenizer assets are needed.
 """
 
@@ -84,7 +86,7 @@ def _config_dict(hidden: int, inter: int) -> dict:
         "moe_intermediate_size": inter,
         "n_routed_experts": _NUM_EXPERTS,
         "num_experts_per_tok": _TOP_K,
-        "n_shared_experts": 0,
+        "n_shared_experts": 1,
         "routed_scaling_factor": 1.0,
         "hidden_act": "silu",
         "vocab_size": _VOCAB,
@@ -259,6 +261,41 @@ class _SimpleNamespaceConfig:
         self.__dict__.update(_config_dict(hidden, inter))
 
 
+def _shared_expert_items(
+    layer_id: int, gate_up, down, gate_up_scale, down_scale, inter: int, block: int
+):
+    """Canonical shared-expert checkpoint entries for one layer.
+
+    The reference model fuses gate+up into gate_up_proj; the loader's
+    stacked_params_mapping consumes canonical gate_proj/up_proj/down_proj
+    names (plus weight_scale_inv for block-fp8). Shared experts are
+    dense/non-routed, so both layouts carry these identical entries.
+    """
+    stem = f"model.layers.{layer_id}.mlp.shared_experts"
+    items = [
+        (f"{stem}.gate_proj.weight", gate_up[:inter].clone()),
+        (f"{stem}.up_proj.weight", gate_up[inter:].clone()),
+        (f"{stem}.down_proj.weight", down.clone()),
+    ]
+    if gate_up_scale is not None:
+        blocks_per_gate = inter // block
+        assert 2 * blocks_per_gate == gate_up_scale.shape[0]
+        items.extend(
+            [
+                (
+                    f"{stem}.gate_proj.weight_scale_inv",
+                    gate_up_scale[:blocks_per_gate].clone(),
+                ),
+                (
+                    f"{stem}.up_proj.weight_scale_inv",
+                    gate_up_scale[blocks_per_gate:].clone(),
+                ),
+                (f"{stem}.down_proj.weight_scale_inv", down_scale.clone()),
+            ]
+        )
+    return items
+
+
 def _write_checkpoints(root: str, quant_config, hidden: int, inter: int):
     """Derive two loadable checkpoint dirs from one filled reference model.
 
@@ -266,16 +303,39 @@ def _write_checkpoints(root: str, quant_config, hidden: int, inter: int):
           consumed by A's dense fused-expert loader.
     on/:  per-expert fused layout (experts.{e}.w13_weight[...]) intercepted by
           B's expert-cache host-store streaming.
+    Shared experts are dense: both layouts carry the identical canonical
+    entries, which the loader consumes without interception.
     Bytes are identical across layouts by construction.
     """
     ref = _build_reference(quant_config, hidden, inter)
     items_off, items_on = [], []
     for name, param in sorted(ref.named_parameters()):
-        if ".mlp.experts.w13_weight" in name or ".mlp.experts.w2_weight" in name:
+        if (
+            ".mlp.experts.w13_weight" in name
+            or ".mlp.experts.w2_weight" in name
+            or ".mlp.shared_experts.gate_up_proj" in name
+            or ".mlp.shared_experts.down_proj" in name
+        ):
             continue
         cpu = param.data.detach().cpu()
         items_off.append((name, cpu.clone()))
         items_on.append((name, cpu.clone()))
+
+    for i in range(_NUM_LAYERS):
+        shared = ref.model.layers[i].mlp.shared_experts
+        gate_up = shared.gate_up_proj.weight.data.detach().cpu()
+        down = shared.down_proj.weight.data.detach().cpu()
+        gate_up_scale = getattr(shared.gate_up_proj, "weight_scale_inv", None)
+        down_scale = getattr(shared.down_proj, "weight_scale_inv", None)
+        if gate_up_scale is not None:
+            gate_up_scale = gate_up_scale.data.detach().cpu()
+        if down_scale is not None:
+            down_scale = down_scale.data.detach().cpu()
+        shared_items = _shared_expert_items(
+            i, gate_up, down, gate_up_scale, down_scale, inter, _FP_BLOCK
+        )
+        items_off.extend(shared_items)
+        items_on.extend([(name, tensor.clone()) for name, tensor in shared_items])
 
     block = _FP_BLOCK
     for i in range(_NUM_LAYERS):
@@ -385,6 +445,50 @@ class TestExpertCacheEngineArgValidation(CustomTestCase):
         del kwargs["cuda_graph_backend_decode"]
         with self.assertRaises(ValueError):
             validate_moe_expert_cache(kwargs)
+
+    def test_config_carries_one_shared_expert(self):
+        self.assertEqual(_config_dict(_HIDDEN, _INTER)["n_shared_experts"], 1)
+
+    def test_shared_expert_items_split_names_and_bytes(self):
+        inter, block = 128, 128
+        gate_up = torch.arange(2 * inter * 64, dtype=torch.float32).reshape(2 * inter, 64)
+        down = torch.arange(64 * inter, dtype=torch.float32).reshape(64, inter)
+        gate_up_scale = torch.arange(2, dtype=torch.float32).reshape(2, 1)
+        down_scale = torch.arange(1, dtype=torch.float32).reshape(1, 1)
+        items = _shared_expert_items(3, gate_up, down, gate_up_scale, down_scale, inter, block)
+        by_name = dict(items)
+        stem = "model.layers.3.mlp.shared_experts"
+        self.assertEqual(
+            sorted(by_name),
+            sorted(
+                f"{stem}.{p}.{s}"
+                for p in ("gate_proj", "up_proj", "down_proj")
+                for s in ("weight", "weight_scale_inv")
+            ),
+        )
+        self.assertTrue(torch.equal(by_name[f"{stem}.gate_proj.weight"], gate_up[:inter]))
+        self.assertTrue(torch.equal(by_name[f"{stem}.up_proj.weight"], gate_up[inter:]))
+        self.assertTrue(torch.equal(by_name[f"{stem}.down_proj.weight"], down))
+        self.assertTrue(
+            torch.equal(
+                by_name[f"{stem}.gate_proj.weight_scale_inv"], gate_up_scale[:1]
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                by_name[f"{stem}.up_proj.weight_scale_inv"], gate_up_scale[1:]
+            )
+        )
+        self.assertTrue(
+            torch.equal(by_name[f"{stem}.down_proj.weight_scale_inv"], down_scale)
+        )
+
+    def test_shared_expert_items_bf16_has_no_scales(self):
+        gate_up = torch.zeros(2 * _INTER, _HIDDEN)
+        down = torch.zeros(_HIDDEN, _INTER)
+        items = _shared_expert_items(0, gate_up, down, None, None, _INTER, _FP_BLOCK)
+        self.assertEqual(len(items), 3)
+        self.assertTrue(all(name.endswith(".weight") for name, _ in items))
 
 
 class _EngineParityBase(CustomTestCase):
