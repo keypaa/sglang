@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
 
@@ -211,6 +211,49 @@ def capture_cuda_graphs(
     return CudaGraphsCapture(eager_runner=eager_runner, prefill=prefill, decode=decode)
 
 
+def _populate_attention_and_moe_layers(model_runner: ModelRunner) -> Optional[Any]:
+    """Discover the decoder layer model, compute its attention/MoE layer
+    lists, and assign all five onto model_runner. Returns the resolved
+    language model, or None when even that is undiscoverable (in which
+    case nothing is assigned). When the language model resolves but owns
+    no `layers`, the lists stay unset — callers tell the cases apart via
+    the return together with the assigned attributes."""
+    # Resolve the decoder once. Some VLM wrappers (for example Kimi-VL)
+    # expose it as ``language_model`` rather than ``model``.
+    try:
+        language_model = resolve_language_model(model_runner.model)
+    except AttributeError:
+        return None
+
+    # Collect attention layers and moe layers from the model. Keep a VLM
+    # wrapper that exposes ``language_model`` unchanged: assigning it to
+    # ``model`` would register a duplicate module alias and duplicate the
+    # model's state-dict namespace.
+    if hasattr(model_runner.model, "model"):
+        model_runner.model.model = language_model
+
+    # Find the module that owns the decoder `layers`. Models wrap it at
+    # varying depths: a direct text model exposes `.layers`, a CausalLM
+    # wraps it as `.model.layers`, and some multimodal models add another
+    # level (e.g. DeepSeek-OCR: OCR wrapper -> Deepseek*ForCausalLM ->
+    # text model -> `.layers`). Descend the `.model` chain until we find it.
+    layer_model = language_model
+    while not hasattr(layer_model, "layers") and hasattr(layer_model, "model"):
+        layer_model = layer_model.model
+
+    if not hasattr(layer_model, "layers"):
+        return language_model
+
+    (
+        model_runner.attention_layers,
+        model_runner.moe_layers,
+        model_runner.moe_fusions,
+        model_runner.dsa_indexers,
+        model_runner.mha_companion_layers,
+    ) = compute_attention_and_moe_layers(layer_model)
+    return language_model
+
+
 def capture_prefill_graph(
     *,
     model_runner: ModelRunner,
@@ -281,11 +324,8 @@ def capture_prefill_graph(
         )
         return result(eager_runner)
 
-    # Resolve the decoder once. Some VLM wrappers (for example Kimi-VL)
-    # expose it as ``language_model`` rather than ``model``.
-    try:
-        language_model = resolve_language_model(model_runner.model)
-    except AttributeError:
+    language_model = _populate_attention_and_moe_layers(model_runner)
+    if language_model is None:
         logger.warning(
             "Disable prefill CUDA graph because the model is not a language model"
         )
@@ -337,35 +377,13 @@ def capture_prefill_graph(
         )
         return eager_runner
 
-    # Collect attention layers and moe layers from the model. Keep a VLM
-    # wrapper that exposes ``language_model`` unchanged: assigning it to
-    # ``model`` would register a duplicate module alias and duplicate the
-    # model's state-dict namespace.
-    if hasattr(model_runner.model, "model"):
-        model_runner.model.model = language_model
-
-    # Find the module that owns the decoder `layers`. Models wrap it at
-    # varying depths: a direct text model exposes `.layers`, a CausalLM
-    # wraps it as `.model.layers`, and some multimodal models add another
-    # level (e.g. DeepSeek-OCR: OCR wrapper -> Deepseek*ForCausalLM ->
-    # text model -> `.layers`). Descend the `.model` chain until we find it.
-    layer_model = language_model
-    while not hasattr(layer_model, "layers") and hasattr(layer_model, "model"):
-        layer_model = layer_model.model
-
-    if not hasattr(layer_model, "layers"):
+    # The helper assigns the layer lists only when the decoder `layers`
+    # are discoverable; otherwise they stay unset.
+    if getattr(model_runner, "moe_layers", None) is None:
         logger.warning(
             "Disable prefill CUDA graph because the model does not have a 'layers' attribute"
         )
         return result(None)
-
-    (
-        model_runner.attention_layers,
-        model_runner.moe_layers,
-        model_runner.moe_fusions,
-        model_runner.dsa_indexers,
-        model_runner.mha_companion_layers,
-    ) = compute_attention_and_moe_layers(layer_model)
 
     if len(model_runner.attention_layers) < model_runner.model_config.num_hidden_layers:
         # TODO(yuwei): support Non-Standard GQA
@@ -432,6 +450,13 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         return no_capture
     if model_runner.device == "cpu" and not get_flags().capture.enable_torch_compile:
         return no_capture
+
+    # Prefill-disabled configs never ran the layer collection in
+    # capture_prefill_graph, but decode capture needs the lists (e.g. the
+    # tc_piecewise forward context). Populate only when unset so a
+    # preceding prefill capture is never recomputed.
+    if getattr(model_runner, "moe_layers", None) is None:
+        _populate_attention_and_moe_layers(model_runner)
 
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
