@@ -100,7 +100,9 @@ def _config_dict(hidden: int, inter: int) -> dict:
         "first_k_dense_replace": 0,
         "moe_layer_freq": 1,
         "q_lora_rank": None,
-        "kv_lora_rank": 32,
+        # Stock Triton grouped decode needs next_pow2(kv_lora + rope) ==
+        # next_pow2(kv_lora) in its MLA branch (both 64 here; 32/16 gave 64 vs 32).
+        "kv_lora_rank": 48,
         "qk_nope_head_dim": 16,
         "qk_rope_head_dim": 16,
         "v_head_dim": 16,
@@ -448,6 +450,20 @@ class TestExpertCacheEngineArgValidation(CustomTestCase):
 
     def test_config_carries_one_shared_expert(self):
         self.assertEqual(_config_dict(_HIDDEN, _INTER)["n_shared_experts"], 1)
+
+    def test_config_mla_dims_satisfy_decode_kernel(self):
+        def _next_pow2(n):
+            p = 1
+            while p < n:
+                p *= 2
+            return p
+
+        for hidden, inter in ((_HIDDEN, _INTER), (_FP_HIDDEN, _FP_INTER)):
+            cfg = _config_dict(hidden, inter)
+            self.assertEqual(
+                _next_pow2(cfg["kv_lora_rank"] + cfg["qk_rope_head_dim"]),
+                _next_pow2(cfg["kv_lora_rank"]),
+            )
 
     def test_shared_expert_items_split_names_and_bytes(self):
         inter, block = 128, 128
