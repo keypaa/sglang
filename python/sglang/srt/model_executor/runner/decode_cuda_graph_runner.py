@@ -500,11 +500,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         bs = max(num_tokens // self.captured_req_width, 1)
         forward_batch, attn_backend, _ = self.capture_prepare(bs)
         attn_backend.init_forward_metadata(forward_batch)
-        tc_ctx = (
-            self._tc_piecewise_context(forward_batch, num_tokens=num_tokens)
-            if self._uses_tc_piecewise()
-            else empty_context()
-        )
+        # Unconditional: the only caller is TcPiecewiseCudaGraphBackend, and
+        # self.backend is unreadable here — this runs reentrantly from
+        # resolve_decode_backend during __init__, before the assignment lands.
+        tc_ctx = self._tc_piecewise_context(forward_batch, num_tokens=num_tokens)
         with forward_context(ForwardContext(attn_backend=attn_backend)), tc_ctx:
             self.model_runner.model.forward(
                 forward_batch.input_ids,
