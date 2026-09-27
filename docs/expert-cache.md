@@ -98,11 +98,12 @@ Flags:
 Constraints (enforced by `validate_moe_expert_cache` + model-init guards,
 fail fast at startup):
 
-- **Graph mode**: either `--disable-cuda-graph` (eager decode, unchanged M1/M2
-  behavior) or segmented decode graphs via
-  `--cuda-graph-backend-decode tc_piecewise`. Full, breakable, and unset
-  decode backends are rejected at startup with a message naming both allowed
-  options.
+- **Graph mode**: either `--disable-cuda-graph` (eager decode, the only
+  validated mode) or segmented decode graphs via
+  `--cuda-graph-backend-decode tc_piecewise` (accepted by the guard but
+  parked — see M3 status below, not validated support). Full, breakable,
+  and unset decode backends are rejected at startup with a message naming
+  both allowed options.
 - **TP=1 / EP=1** only.
 - **Quantization**: bf16 (unquantized) or **fp8 block-wise** checkpoints
   (`is_checkpoint_fp8_serialized`, 128×128 `weight_scale_inv` blocks) — on
@@ -128,32 +129,48 @@ Telemetry: each layer's `LayerRuntime.telemetry()` returns
 - `stall_ms_total`, `stall_ms_last` — wall time inside `ensure_resident`
   while copies were pending; an all-hit call resets `stall_ms_last` to 0.
 
-Under tc_piecewise graphs the per-replay prepare hook adds a small
-per-MoE-layer cost in the segment gap on every decode step — host id read,
-residency, fence, remap — on top of these counters.
+Under tc_piecewise graphs (parked, unvalidated) the per-replay prepare hook
+would add a small per-MoE-layer cost in the segment gap on every decode
+step — host id read, residency, fence, remap — on top of these counters.
 
 ## Phase 3 milestone 3: CUDA-graph-safe decode (tc_piecewise)
 
-You can now leave CUDA graphs on. Besides the eager configuration above,
-`validate_moe_expert_cache` accepts cache-on when the decode graph backend is
-`tc_piecewise` (`--cuda-graph-backend-decode tc_piecewise`). Each cached MoE
+> Status: experimental and parked — graphs-on operation is not validated
+> end-to-end. `--disable-cuda-graph` (eager) remains the only validated mode.
+> tc_piecewise decode is blocked upstream: torch.compile fullgraph cannot
+> trace the disable-wrapped Triton attention kernels that are the only MLA
+> decode path on L4-class GPUs (no alternative attention backend is available
+> there); running with fullgraph=False would require redesigning the shared
+> piecewise compiler contract.
+> Breakable decode is blocked: stock `BreakableCudaGraphBackend` cannot capture
+> generative decode output (`LogitsProcessorOutput` is unsupported in its buffer
+> helpers), and a shimmed probe died with an undiagnosed scheduler SIGKILL on
+> first generate (see
+> `.superpowers/sdd/2026-08-22-expert-cache-phase3-m3-cudagraph/task-A0-report.md`).
+
+The graphs-on mechanism was built so you could leave CUDA graphs on, but it is
+not validated support. Besides the eager configuration above,
+`validate_moe_expert_cache` still accepts cache-on when the decode graph
+backend is `tc_piecewise` (`--cuda-graph-backend-decode tc_piecewise`), and
+that acceptance describes intent, not validated support. Each cached MoE
 layer registers a split point (`expert_cache_prepare` in
 `piecewise_hook.py`) whose body re-executes as Python in the segment gap on
-every decode-step replay:
+every decode-step replay (mechanism validation only — probe-verified: split-op
+bodies re-execute per replay with real ids, not end-to-end feature support):
 
 1. Read the routed ids on host (`topk_ids.tolist()`).
 2. `ensure_resident` streams missing experts into pool slots.
 3. Fence pending H2D copies and refresh the device slot map.
 4. Return slot-remapped ids; the captured MoE piece gathers pool rows by them.
 
-No weight bytes move inside any captured graph, and the residency fence stays
-outside capture — a captured graph still cannot wait on the transfer stream.
-Because both phases share one compilation config, opting decode into
-`tc_piecewise` also splits prefill's compiled graphs at MoE whenever prefill
-compiles piecewise — structurally necessary so the prepare hook runs in every
-piecewise phase — so the same small per-layer eager-gap cost applies to prefill.
-Cross-layer/token prefetch pipelining remains out of scope: demand misses are
-served only at segment gaps.
+In this parked design, no weight bytes move inside any captured graph, and the
+residency fence stays outside capture — a captured graph still cannot wait on
+the transfer stream. Because both phases share one compilation config, opting
+decode into `tc_piecewise` also splits prefill's compiled graphs at MoE
+whenever prefill compiles piecewise — structurally necessary so the prepare
+hook runs in every piecewise phase — so the same small per-layer eager-gap
+cost would apply to prefill. Cross-layer/token prefetch pipelining remains out
+of scope: demand misses would be served only at segment gaps.
 
 ## Verification status
 
